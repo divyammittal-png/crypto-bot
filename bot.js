@@ -67,7 +67,7 @@ function fetch(url) {
 async function getKlines(symbol) {
   const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${INTERVAL}&limit=${KLINE_LIMIT}`;
   const raw = await fetch(url);
-  // return close prices as floats
+  if (!Array.isArray(raw)) throw new Error(`Binance klines error: ${JSON.stringify(raw)}`);
   return raw.map(k => parseFloat(k[4]));
 }
 

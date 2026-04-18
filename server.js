@@ -26,6 +26,7 @@ async function refreshPrices() {
   try {
     const symbolsParam = encodeURIComponent(JSON.stringify(SYMBOLS));
     const tickers = await httpsGet(`https://api.binance.com/api/v3/ticker/24hr?symbols=${symbolsParam}`);
+    if (!Array.isArray(tickers)) throw new Error(`Unexpected response: ${JSON.stringify(tickers)}`);
     for (const t of tickers) {
       livePrices[t.symbol] = {
         price:              parseFloat(t.lastPrice),
@@ -35,8 +36,9 @@ async function refreshPrices() {
         volume:             parseFloat(t.quoteVolume),
       };
     }
-  } catch {
-    // keep stale prices on error
+    console.log(`[${new Date().toISOString()}] Prices refreshed: ${tickers.map(t => `${t.symbol}=${t.lastPrice}`).join(' ')}`);
+  } catch (e) {
+    console.error(`[${new Date().toISOString()}] Price refresh failed: ${e.message}`);
   }
 }
 
