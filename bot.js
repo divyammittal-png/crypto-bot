@@ -144,7 +144,7 @@ async function processSymbol(symbol) {
 
   marketSnapshot[symbol] = { price, ema9: +ema9.toFixed(4), ema21: +ema21.toFixed(4), rsi: +rsiVal.toFixed(1) };
 
-  const bullish = ema9 > ema21 && rsiVal < 35;
+  const bullish = rsiVal < 40;
   const bearish = ema9 < ema21 && rsiVal > 65;
 
   log(`${symbol} | price=${price.toFixed(4)} EMA9=${ema9.toFixed(4)} EMA21=${ema21.toFixed(4)} RSI=${rsiVal.toFixed(1)} pos=${pos ? 'OPEN' : 'NONE'}`);
@@ -161,7 +161,7 @@ async function processSymbol(symbol) {
       takeProfit: price * (1 + TAKE_PROFIT_PCT),
     };
     log(`BUY  ${symbol} | qty=${qty.toFixed(6)} @ ${price.toFixed(4)} spend=£${spend.toFixed(2)} SL=${positions[symbol].stopLoss.toFixed(4)} TP=${positions[symbol].takeProfit.toFixed(4)} balance=£${balance.toFixed(2)}`);
-    const trade = { time: new Date().toISOString(), symbol, side: 'BUY', reason: 'ema-cross+rsi', price, qty: +qty.toFixed(6), spend: +spend.toFixed(2), stopLoss: +positions[symbol].stopLoss.toFixed(4), takeProfit: +positions[symbol].takeProfit.toFixed(4), balance: +balance.toFixed(2) };
+    const trade = { time: new Date().toISOString(), symbol, side: 'BUY', reason: 'rsi<40', price, qty: +qty.toFixed(6), spend: +spend.toFixed(2), stopLoss: +positions[symbol].stopLoss.toFixed(4), takeProfit: +positions[symbol].takeProfit.toFixed(4), balance: +balance.toFixed(2) };
     trades.push(trade);
     saveTrades();
   } else if (bearish && pos) {
@@ -186,7 +186,7 @@ async function tick() {
 
 log('=== Crypto Momentum Bot Started ===');
 log(`Symbols: ${SYMBOLS.join(', ')}`);
-log(`Strategy: EMA9/21 crossover + RSI14 | Buy RSI<35 EMA9>EMA21 | Sell RSI>65 EMA9<EMA21`);
+log(`Strategy: RSI14 + EMA9/21 | Buy RSI<40 | Sell RSI>65 EMA9<EMA21`);
 log(`Risk: 5% per trade | SL 3% | TP 6% | Paper balance: £${balance}`);
 
 tick();

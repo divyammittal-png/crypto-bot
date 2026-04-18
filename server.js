@@ -1,4 +1,5 @@
 const express = require('express');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
@@ -6,6 +7,41 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const TRADES_FILE = path.join(__dirname, 'trades.json');
 const STATE_FILE  = path.join(__dirname, 'state.json');
+const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT'];
+const PRICE_REFRESH_MS = 5000;
+
+let livePrices = {}; // { SYMBOL: { price, priceChangePercent, high, low } }
+
+function httpsGet(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, res => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+    }).on('error', reject);
+  });
+}
+
+async function refreshPrices() {
+  try {
+    const symbolsParam = encodeURIComponent(JSON.stringify(SYMBOLS));
+    const tickers = await httpsGet(`https://api.binance.com/api/v3/ticker/24hr?symbols=${symbolsParam}`);
+    for (const t of tickers) {
+      livePrices[t.symbol] = {
+        price:              parseFloat(t.lastPrice),
+        priceChangePercent: parseFloat(t.priceChangePercent),
+        high:               parseFloat(t.highPrice),
+        low:                parseFloat(t.lowPrice),
+        volume:             parseFloat(t.quoteVolume),
+      };
+    }
+  } catch {
+    // keep stale prices on error
+  }
+}
+
+refreshPrices();
+setInterval(refreshPrices, PRICE_REFRESH_MS);
 
 function readJSON(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -15,7 +51,12 @@ function readJSON(file, fallback) {
 app.get('/api/data', (req, res) => {
   const state  = readJSON(STATE_FILE,  { balance: 1000, startBalance: 1000, totalPnl: 0, positions: {}, market: {}, updatedAt: null });
   const trades = readJSON(TRADES_FILE, []);
-  res.json({ state, trades });
+  // merge live prices into market snapshot from bot
+  const market = { ...state.market };
+  for (const sym of SYMBOLS) {
+    if (livePrices[sym]) market[sym] = { ...(market[sym] || {}), ...livePrices[sym] };
+  }
+  res.json({ state: { ...state, market }, trades });
 });
 
 app.get('/', (req, res) => {
@@ -406,13 +447,19 @@ async function refresh() {
     if (!m) return \`<div class="ticker-card"><div class="ticker-sym">\${sym.replace('USDT','')}</div><div style="color:var(--text-dim);font-size:11px">loading…</div></div>\`;
     const emaCls   = m.ema9 > m.ema21 ? 'ema-bull' : 'ema-bear';
     const emaLabel = m.ema9 > m.ema21 ? '▲ BULL'   : '▼ BEAR';
-    const rsiCls   = m.rsi < 35 ? 'rsi-low' : m.rsi > 65 ? 'rsi-high' : '';
+    const rsiCls   = m.rsi < 40 ? 'rsi-low' : m.rsi > 65 ? 'rsi-high' : '';
     const hasPos   = !!positions[sym];
+    const chgCls   = m.priceChangePercent >= 0 ? 'up' : 'down';
+    const dec      = sym === 'BTCUSDT' ? 2 : sym === 'XRPUSDT' ? 4 : 2;
     return \`<div class="ticker-card" style="\${hasPos ? 'border-color:rgba(0,255,136,.3)' : ''}">
       <div class="ticker-sym">\${sym.replace('USDT','')} \${hasPos ? '<span style="color:var(--green);font-size:9px">● LONG</span>' : ''}</div>
-      <div class="ticker-price">\${fmt(m.price, sym.includes('BTC') ? 2 : sym.includes('XRP') ? 4 : 2)}</div>
-      <div class="ticker-row"><span>EMA</span><span class="val \${emaCls}">\${emaLabel}</span></div>
-      <div class="ticker-row"><span>RSI</span><span class="val \${rsiCls}">\${m.rsi}</span></div>
+      <div style="display:flex;align-items:baseline;gap:8px">
+        <div class="ticker-price">\${m.price != null ? fmt(m.price, dec) : '—'}</div>
+        \${m.priceChangePercent != null ? \`<span class="\${chgCls}" style="font-size:11px">\${m.priceChangePercent >= 0 ? '+' : ''}\${m.priceChangePercent.toFixed(2)}%</span>\` : ''}
+      </div>
+      \${m.high != null ? \`<div class="ticker-row"><span>H/L</span><span class="val" style="font-size:10px">\${fmt(m.high,dec)} / \${fmt(m.low,dec)}</span></div>\` : ''}
+      <div class="ticker-row"><span>EMA</span><span class="val \${emaCls}">\${m.ema9 != null ? emaLabel : '—'}</span></div>
+      <div class="ticker-row"><span>RSI</span><span class="val \${rsiCls}">\${m.rsi != null ? m.rsi : '—'}</span></div>
     </div>\`;
   }).join('');
 }
