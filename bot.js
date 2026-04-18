@@ -2,8 +2,13 @@ const https = require('https');
 const fs = require('fs');
 
 const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT'];
-const INTERVAL = '1m';
-const KLINE_LIMIT = 50; // enough for EMA21 + RSI14
+const COINGECKO_IDS = {
+  BTCUSDT: 'bitcoin',
+  ETHUSDT: 'ethereum',
+  SOLUSDT: 'solana',
+  BNBUSDT: 'binancecoin',
+  XRPUSDT: 'ripple',
+};
 const TRADE_PCT = 0.05;
 const STOP_LOSS_PCT = 0.03;
 const TAKE_PROFIT_PCT = 0.06;
@@ -51,9 +56,13 @@ function saveState() {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-function fetch(url) {
+function httpsGet(url) {
+  const apiKey = process.env.COINGECKO_API_KEY;
+  const options = {
+    headers: { 'Accept': 'application/json', 'User-Agent': 'crypto-bot/1.0', ...(apiKey && { 'x-cg-demo-api-key': apiKey }) },
+  };
   return new Promise((resolve, reject) => {
-    https.get(url, res => {
+    https.get(url, options, res => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
@@ -64,11 +73,15 @@ function fetch(url) {
   });
 }
 
+const delay = ms => new Promise(r => setTimeout(r, ms));
+
 async function getKlines(symbol) {
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${INTERVAL}&limit=${KLINE_LIMIT}`;
-  const raw = await fetch(url);
-  if (!Array.isArray(raw)) throw new Error(`Binance klines error: ${JSON.stringify(raw)}`);
-  return raw.map(k => parseFloat(k[4]));
+  const id = COINGECKO_IDS[symbol];
+  const url = `https://api.coingecko.com/api/v3/coins/${id}/ohlc?vs_currency=usd&days=1`;
+  const raw = await httpsGet(url);
+  if (!Array.isArray(raw)) throw new Error(`CoinGecko OHLC error for ${symbol}: ${JSON.stringify(raw)}`);
+  // CoinGecko returns [timestamp, open, high, low, close] — close is index 4
+  return raw.map(k => k[4]);
 }
 
 function ema(prices, period) {
@@ -180,6 +193,7 @@ async function tick() {
   log(`--- TICK | balance=£${balance.toFixed(2)} openPositions=${Object.keys(positions).join(',') || 'none'} ---`);
   for (const symbol of SYMBOLS) {
     await processSymbol(symbol);
+    await delay(3000); // space out CoinGecko free-tier calls (~5 req/min)
   }
   saveState();
 }
@@ -189,5 +203,8 @@ log(`Symbols: ${SYMBOLS.join(', ')}`);
 log(`Strategy: RSI14 + EMA9/21 | Buy RSI<40 | Sell RSI>65 EMA9<EMA21`);
 log(`Risk: 5% per trade | SL 3% | TP 6% | Paper balance: £${balance}`);
 
-tick();
-setInterval(tick, POLL_MS);
+// Stagger startup by 5s so server.js price fetch fires first
+delay(5000).then(() => {
+  tick();
+  setInterval(tick, POLL_MS);
+});

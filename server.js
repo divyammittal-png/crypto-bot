@@ -8,13 +8,24 @@ const PORT = process.env.PORT || 3000;
 const TRADES_FILE = path.join(__dirname, 'trades.json');
 const STATE_FILE  = path.join(__dirname, 'state.json');
 const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT'];
-const PRICE_REFRESH_MS = 5000;
+const COINGECKO_IDS = {
+  BTCUSDT: 'bitcoin',
+  ETHUSDT: 'ethereum',
+  SOLUSDT: 'solana',
+  BNBUSDT: 'binancecoin',
+  XRPUSDT: 'ripple',
+};
+const PRICE_REFRESH_MS = 30000; // 30s — gentle on CoinGecko free tier (~2 req/min)
 
 let livePrices = {}; // { SYMBOL: { price, priceChangePercent, high, low } }
 
 function httpsGet(url) {
+  const apiKey = process.env.COINGECKO_API_KEY;
+  const options = {
+    headers: { 'Accept': 'application/json', 'User-Agent': 'crypto-bot/1.0', ...(apiKey && { 'x-cg-demo-api-key': apiKey }) },
+  };
   return new Promise((resolve, reject) => {
-    https.get(url, res => {
+    https.get(url, options, res => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
@@ -24,19 +35,24 @@ function httpsGet(url) {
 
 async function refreshPrices() {
   try {
-    const symbolsParam = encodeURIComponent(JSON.stringify(SYMBOLS));
-    const tickers = await httpsGet(`https://api.binance.com/api/v3/ticker/24hr?symbols=${symbolsParam}`);
-    if (!Array.isArray(tickers)) throw new Error(`Unexpected response: ${JSON.stringify(tickers)}`);
-    for (const t of tickers) {
-      livePrices[t.symbol] = {
-        price:              parseFloat(t.lastPrice),
-        priceChangePercent: parseFloat(t.priceChangePercent),
-        high:               parseFloat(t.highPrice),
-        low:                parseFloat(t.lowPrice),
-        volume:             parseFloat(t.quoteVolume),
+    const ids = Object.values(COINGECKO_IDS).join(',');
+    const coins = await httpsGet(
+      `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${ids}&price_change_percentage=24h`
+    );
+    if (!Array.isArray(coins)) throw new Error(`Unexpected response: ${JSON.stringify(coins)}`);
+    const byId = Object.fromEntries(coins.map(c => [c.id, c]));
+    for (const [sym, id] of Object.entries(COINGECKO_IDS)) {
+      const c = byId[id];
+      if (!c) continue;
+      livePrices[sym] = {
+        price:              c.current_price,
+        priceChangePercent: c.price_change_percentage_24h,
+        high:               c.high_24h,
+        low:                c.low_24h,
+        volume:             c.total_volume,
       };
     }
-    console.log(`[${new Date().toISOString()}] Prices refreshed: ${tickers.map(t => `${t.symbol}=${t.lastPrice}`).join(' ')}`);
+    console.log(`[${new Date().toISOString()}] Prices refreshed: ${Object.entries(livePrices).map(([s,v]) => `${s}=${v.price}`).join(' ')}`);
   } catch (e) {
     console.error(`[${new Date().toISOString()}] Price refresh failed: ${e.message}`);
   }
