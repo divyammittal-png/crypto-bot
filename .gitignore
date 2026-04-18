@@ -1,0 +1,4 @@
+node_modules/
+trades.json
+state.json
+*.log
