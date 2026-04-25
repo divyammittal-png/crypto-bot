@@ -6,13 +6,15 @@ const path  = require('path');
 let Anthropic;
 try { Anthropic = require('@anthropic-ai/sdk'); } catch { /* optional */ }
 
+const { dataPath } = require('./storage');
+
 const F = {
-  state:   path.join(__dirname, 'state.json'),
-  trades:  path.join(__dirname, 'trades.json'),
-  learning:path.join(__dirname, 'learning.json'),
-  weights: path.join(__dirname, 'strategy-weights.json'),
-  config:  path.join(__dirname, 'config.json'),
-  reports: path.join(__dirname, 'analyst-reports.json'),
+  state:   dataPath('state.json'),
+  trades:  dataPath('trades.json'),
+  learning:dataPath('learning.json'),
+  weights: dataPath('strategy-weights.json'),
+  config:  dataPath('config.json'),
+  reports: dataPath('analyst-reports.json'),
 };
 
 function loadJSON(f) { try { return JSON.parse(fs.readFileSync(f,'utf8')); } catch { return null; } }

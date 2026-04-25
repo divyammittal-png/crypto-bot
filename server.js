@@ -9,17 +9,19 @@ const path    = require('path');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
+const { dataPath } = require('./storage');
+
 const F = {
-  state:         path.join(__dirname, 'state.json'),
-  trades:        path.join(__dirname, 'trades.json'),
-  learning:      path.join(__dirname, 'learning.json'),
-  sentiment:     path.join(__dirname, 'sentiment.json'),
-  weights:       path.join(__dirname, 'strategy-weights.json'),
-  reports:       path.join(__dirname, 'reports.json'),
-  analystReports:path.join(__dirname, 'analyst-reports.json'),
-  config:        path.join(__dirname, 'config.json'),
-  configLog:     path.join(__dirname, 'config-log.json'),
-  backtest:      path.join(__dirname, 'backtest-results.json'),
+  state:         dataPath('state.json'),
+  trades:        dataPath('trades.json'),
+  learning:      dataPath('learning.json'),
+  sentiment:     dataPath('sentiment.json'),
+  weights:       dataPath('strategy-weights.json'),
+  reports:       dataPath('reports.json'),
+  analystReports:dataPath('analyst-reports.json'),
+  config:        dataPath('config.json'),
+  configLog:     dataPath('config-log.json'),
+  backtest:      dataPath('backtest-results.json'),
 };
 
 const ALL_ASSETS = ['BTC','ETH','SOL','BNB','XRP','AAPL','TSLA','NVDA','SPY','AMZN','MSFT','GOOGL','META','NFLX','JPM','QQQ','GC=F','SI=F','CL=F','NG=F'];

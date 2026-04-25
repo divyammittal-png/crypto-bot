@@ -12,18 +12,22 @@ try { Anthropic = require('@anthropic-ai/sdk'); } catch { /* optional */ }
 const ai = (Anthropic && process.env.ANTHROPIC_API_KEY)
   ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
 
+// ─── PERSISTENT STORAGE ───────────────────────────────────────────────────────
+const { dataPath, migrate } = require('./storage');
+migrate(); // copy local files → /data on first volume mount
+
 // ─── FILE PATHS ────────────────────────────────────────────────────────────────
 const F = {
-  state:    path.join(__dirname, 'state.json'),
-  trades:   path.join(__dirname, 'trades.json'),
-  learning: path.join(__dirname, 'learning.json'),
-  sentiment:path.join(__dirname, 'sentiment.json'),
-  weights:  path.join(__dirname, 'strategy-weights.json'),
-  reports:  path.join(__dirname, 'reports.json'),
-  config:   path.join(__dirname, 'config.json'),
-  configLog:path.join(__dirname, 'config-log.json'),
-  backtest: path.join(__dirname, 'backtest-results.json'),
-  avCache:  path.join(__dirname, 'av-cache.json'),
+  state:    dataPath('state.json'),
+  trades:   dataPath('trades.json'),
+  learning: dataPath('learning.json'),
+  sentiment:dataPath('sentiment.json'),
+  weights:  dataPath('strategy-weights.json'),
+  reports:  dataPath('reports.json'),
+  config:   dataPath('config.json'),
+  configLog:dataPath('config-log.json'),
+  backtest: dataPath('backtest-results.json'),
+  avCache:  dataPath('av-cache.json'),
 };
 
 // ─── ASSET UNIVERSE ───────────────────────────────────────────────────────────
