@@ -143,8 +143,8 @@ h3{font-size:13px;font-weight:600;color:var(--muted);margin-bottom:8px}
 .section{background:#fff;border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px;box-shadow:var(--shadow)}
 
 /* STAT CARDS */
-.stats-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:16px}
-@media(max-width:1200px){.stats-grid{grid-template-columns:repeat(3,1fr)}}
+.stats-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:12px;margin-bottom:16px}
+@media(max-width:1400px){.stats-grid{grid-template-columns:repeat(4,1fr)}}
 @media(max-width:768px){.stats-grid{grid-template-columns:repeat(2,1fr)}}
 .stat-card{background:#fff;border:1px solid var(--border);border-radius:10px;padding:14px;box-shadow:var(--shadow);position:relative;overflow:hidden}
 .stat-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;border-radius:3px 0 0 3px}
@@ -188,6 +188,11 @@ tr.loss td{background:#fff5f5}
 .sharpe-green{color:var(--green);font-weight:700}
 .sharpe-yellow{color:var(--yellow);font-weight:700}
 .sharpe-red{color:var(--red);font-weight:700}
+.pnl-label{font-size:10px;font-weight:700;letter-spacing:.03em;vertical-align:middle}
+.pnl-label-profit{color:var(--green)}
+.pnl-label-loss{color:var(--red)}
+.badge-win{background:#e6f7ee;color:var(--green)}
+.badge-loss-result{background:#fff5f5;color:var(--red)}
 
 /* RISK MONITOR */
 .risk-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
@@ -279,10 +284,15 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
     <div class="stat-value" id="s-today">£—</div>
     <div class="stat-sub" id="s-today-pct">0.00%</div>
   </div>
-  <div class="stat-card" id="total-pnl-card">
-    <div class="stat-label">Total P&amp;L</div>
-    <div class="stat-value" id="s-total-pnl">£—</div>
-    <div class="stat-sub" id="s-total-pct">0.00%</div>
+  <div class="stat-card" id="realised-pnl-card">
+    <div class="stat-label">Realised P&amp;L</div>
+    <div class="stat-value" id="s-realised-pnl">£—</div>
+    <div class="stat-sub" id="s-realised-sub">closed trades</div>
+  </div>
+  <div class="stat-card" id="unrealised-pnl-card">
+    <div class="stat-label">Unrealised P&amp;L</div>
+    <div class="stat-value" id="s-unrealised-pnl">£—</div>
+    <div class="stat-sub" id="s-unrealised-sub">open positions</div>
   </div>
   <div class="stat-card yellow">
     <div class="stat-label">Open Positions</div>
@@ -401,7 +411,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
       <table>
         <thead>
           <tr>
-            <th>Time</th><th>Asset</th><th>Strategy</th><th>Profile</th><th>Side</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Reason</th>
+            <th>Time</th><th>Asset</th><th>Strategy</th><th>Profile</th><th>Side</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Result</th><th>Reason</th>
           </tr>
         </thead>
         <tbody id="trades-body"></tbody>
@@ -611,18 +621,37 @@ function updateStatCards(state, trades) {
   const now24ago = ec.length > 24 ? ec[ec.length-25] : null;
   const todayPnl = now24ago ? total - now24ago.total : 0;
   const todayPct = now24ago && now24ago.total > 0 ? todayPnl/now24ago.total*100 : 0;
-  document.getElementById('s-today').textContent = (todayPnl>=0?'+':'') + '£'+Math.abs(todayPnl).toFixed(2);
+  const todaySign = todayPnl >= 0 ? '+' : '−';
+  document.getElementById('s-today').innerHTML = todaySign + '£' + Math.abs(todayPnl).toFixed(2) + ' <span class="pnl-label ' + (todayPnl>=0?'pnl-label-profit':'pnl-label-loss') + '">' + (todayPnl>=0?'▲ PROFIT':'▼ LOSS') + '</span>';
   document.getElementById('s-today').className = 'stat-value ' + (todayPnl>=0?'up':'dn');
-  document.getElementById('s-today-pct').textContent = (todayPct>=0?'+':'') + todayPct.toFixed(2) + '%';
+  document.getElementById('s-today-pct').textContent = (todayPct>=0?'+':'−') + Math.abs(todayPct).toFixed(2) + '%';
 
-  document.getElementById('s-total-pnl').textContent = (totalPnl>=0?'+':'') + '£'+Math.abs(totalPnl).toFixed(2);
-  document.getElementById('s-total-pnl').className = 'stat-value ' + (totalPnl>=0?'up':'dn');
-  document.getElementById('s-total-pct').textContent = (totalPct>=0?'+':'') + totalPct.toFixed(2) + '%';
-  document.getElementById('total-pnl-card').querySelector('::before');
-  document.getElementById('total-pnl-card').className = 'stat-card ' + (totalPnl>=0?'green':'red');
+  // Realised P&L — sum of all closed trades
+  const realisedPnl = (trades||[]).reduce((s,t)=>s+(t.pnl||0),0);
+  const realisedPct = realisedPnl / 1000 * 100;
+  const rSign = realisedPnl >= 0 ? '+' : '−';
+  document.getElementById('s-realised-pnl').innerHTML = rSign + '£' + Math.abs(realisedPnl).toFixed(2) + ' <span class="pnl-label ' + (realisedPnl>=0?'pnl-label-profit':'pnl-label-loss') + '">' + (realisedPnl>=0?'▲ PROFIT':'▼ LOSS') + '</span>';
+  document.getElementById('s-realised-pnl').className = 'stat-value ' + (realisedPnl>=0?'up':'dn');
+  document.getElementById('s-realised-sub').textContent = (realisedPct>=0?'+':'−') + Math.abs(realisedPct).toFixed(2) + '% of capital · ' + (trades||[]).length + ' trades';
+  document.getElementById('realised-pnl-card').className = 'stat-card ' + (realisedPnl>=0?'green':'red');
 
   const openCount = Object.values(ports).reduce((s,p)=>(s+(p.positions||[]).length),0);
   document.getElementById('s-open').textContent = openCount;
+
+  // Unrealised P&L — open positions marked to market
+  const livePrices = state.livePrices || {};
+  let unrealisedPnl = 0;
+  for (const port of Object.values(ports)) {
+    for (const pos of (port.positions||[])) {
+      const cur = livePrices[pos.asset]?.price || pos.entryPrice;
+      unrealisedPnl += pos.side==='LONG' ? (cur-pos.entryPrice)*pos.qty : (pos.entryPrice-cur)*pos.qty;
+    }
+  }
+  const uSign = unrealisedPnl >= 0 ? '+' : '−';
+  document.getElementById('s-unrealised-pnl').innerHTML = uSign + '£' + Math.abs(unrealisedPnl).toFixed(2) + ' <span class="pnl-label ' + (unrealisedPnl>=0?'pnl-label-profit':'pnl-label-loss') + '">' + (unrealisedPnl>=0?'▲ PROFIT':'▼ LOSS') + '</span>';
+  document.getElementById('s-unrealised-pnl').className = 'stat-value ' + (unrealisedPnl>=0?'up':'dn');
+  document.getElementById('s-unrealised-sub').textContent = openCount + (openCount===1?' position':' positions') + ' open';
+  document.getElementById('unrealised-pnl-card').className = 'stat-card ' + (unrealisedPnl>=0?'green':'red');
 
   // Portfolio heat (simplified)
   const heat = Object.values(ports).reduce((s,p)=>{
@@ -720,7 +749,7 @@ function updateScorecard(trades, weights) {
         <td class="\${sharpeClass}">\${sharpe.toFixed(2)}</td>
         <td>\${maxDD>0?'-£'+maxDD.toFixed(2):'—'}</td>
         <td>\${t.length}</td>
-        <td class="\${pnl>=0?'up':'dn'}">\${pnl>=0?'+':''}£\${Math.abs(pnl).toFixed(2)}</td>
+        <td class="\${pnl>=0?'up':'dn'}">\${pnl>=0?'+':'−'}£\${Math.abs(pnl).toFixed(2)} <span class="pnl-label \${pnl>=0?'pnl-label-profit':'pnl-label-loss'}">\${pnl>=0?'▲':'▼'}</span></td>
         <td>\${(wt*100).toFixed(0)}%</td>\`;
     }).join('');
     return \`<tr><td><strong>\${stratLabel(strat)}</strong></td>\${cols}</tr>\`;
@@ -748,7 +777,7 @@ function updatePositions(state) {
       <td><span class="badge badge-\${pos.side.toLowerCase()}">\${pos.side}</span></td>
       <td>£\${fmtPrice(pos.entryPrice)}</td>
       <td>£\${fmtPrice(cur)}</td>
-      <td class="\${upnl>=0?'up':'dn'}">\${upnl>=0?'+':''}£\${Math.abs(upnl).toFixed(2)}</td>
+      <td class="\${upnl>=0?'up':'dn'}">\${upnl>=0?'+':'−'}£\${Math.abs(upnl).toFixed(2)} <span class="pnl-label \${upnl>=0?'pnl-label-profit':'pnl-label-loss'}">\${upnl>=0?'▲ PROFIT':'▼ LOSS'}</span></td>
       <td>£\${fmtPrice(pos.stopLoss)}</td>
       <td>£\${fmtPrice(pos.takeProfit)}</td>
       <td>\${durStr}</td>
@@ -759,7 +788,7 @@ function updatePositions(state) {
 function updateTrades(trades) {
   const tbody = document.getElementById('trades-body');
   const last50 = (trades||[]).slice(-50).reverse();
-  if (!last50.length) { tbody.innerHTML='<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:20px">No trades yet</td></tr>'; return; }
+  if (!last50.length) { tbody.innerHTML='<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">No trades yet</td></tr>'; return; }
   tbody.innerHTML = last50.map(t => \`<tr class="\${t.win?'win':'loss'}">
     <td>\${new Date(t.closedAt||t.openedAt).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td>
     <td><strong>\${t.asset}</strong></td>
@@ -768,7 +797,8 @@ function updateTrades(trades) {
     <td><span class="badge badge-\${t.side?.toLowerCase()}">\${t.side}</span></td>
     <td>£\${fmtPrice(t.entryPrice)}</td>
     <td>£\${fmtPrice(t.exitPrice)}</td>
-    <td class="\${t.pnl>=0?'up':'dn'}">\${t.pnl>=0?'+':''}£\${Math.abs(t.pnl||0).toFixed(2)}</td>
+    <td class="\${t.pnl>=0?'up':'dn'}">\${t.pnl>=0?'+':'−'}£\${Math.abs(t.pnl||0).toFixed(2)} <span class="pnl-label \${t.pnl>=0?'pnl-label-profit':'pnl-label-loss'}">\${t.pnl>=0?'▲ PROFIT':'▼ LOSS'}</span></td>
+    <td><span class="badge \${t.win?'badge-win':'badge-loss-result'}">\${t.win?'WIN':'LOSS'}</span></td>
     <td>\${t.exitReason||'—'}</td>
   </tr>\`).join('');
 }
