@@ -261,17 +261,108 @@ async function fetchCGOHLC(asset) {
   }
 }
 
+// ─── SHARED: raw GLOBAL_QUOTE API call ───────────────────────────────────────
+async function _doGlobalQuoteFetch(avSym) {
+  const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(avSym)}&apikey=${avKey()}`;
+  const data = await httpsGetJSON(url);
+  if (data.Note || data.Information) {
+    log(`[AV] GLOBAL_QUOTE ${avSym}: ${(data.Note || data.Information).slice(0, 80)}`);
+    return null;
+  }
+  const q = data['Global Quote'];
+  if (!q?.['05. price']) return null;
+  return {
+    price:  +q['05. price'],
+    open:   +q['02. open']   || +q['05. price'],
+    high:   +q['03. high']   || +q['05. price'],
+    low:    +q['04. low']    || +q['05. price'],
+    volume: +q['06. volume'] || 0,
+    chgPct: parseFloat(q['10. change percent']) || 0,
+  };
+}
+
+// ─── SHARED: restore a cached last-close snapshot into live state + pd ────────
+// Called on restart and whenever intraday data is unavailable.
+function _restoreLastClose(asset, entry) {
+  if (!entry?.fallbackPrice) return;
+  state.livePrices[asset] = {
+    price:       entry.fallbackPrice,
+    change24h:   entry.chgPct  || 0,
+    high24h:     entry.high    || entry.fallbackPrice,
+    low24h:      entry.low     || entry.fallbackPrice,
+    isLastClose: true,
+  };
+  // Inject one synthetic candle so getCurrentPrice() returns a non-zero value
+  if (pd[asset].closes.length === 0) {
+    const d = pd[asset];
+    const ts = entry.fetchedAt || Date.now();
+    d.timestamps.push(ts);
+    d.opens.push(entry.fallbackPrice);
+    d.highs.push(entry.high  || entry.fallbackPrice);
+    d.lows.push( entry.low   || entry.fallbackPrice);
+    d.closes.push(entry.fallbackPrice);
+    d.volumes.push(0);
+  }
+  log(`[AV] ${asset}: restored last close $${entry.fallbackPrice.toFixed(2)} from cache (isLastClose)`);
+}
+
+// ─── SHARED: fetch GLOBAL_QUOTE, persist to cache, restore into state ─────────
+// Used both as commodity primary fetch and as equity intraday fallback.
+async function _applyGlobalQuoteFallback(asset, avSym) {
+  if (!avBudgetOk() || !avKey()) return false;
+  try {
+    const quote = await _doGlobalQuoteFetch(avSym);
+    if (!quote) return false;
+    const entry = {
+      fetchedAt:     Date.now(),
+      fallbackPrice: quote.price,
+      high:          quote.high,
+      low:           quote.low,
+      chgPct:        quote.chgPct,
+      avSym,
+      isLastClose:   true,
+    };
+    avCache.data[asset] = entry;
+    avRecordCall();
+    _restoreLastClose(asset, entry);
+    return true;
+  } catch(e) {
+    log(`[AV] ${asset} GLOBAL_QUOTE fallback error: ${e.message}`);
+    return false;
+  }
+}
+
 // ─── ALPHA VANTAGE: EQUITIES — TIME_SERIES_INTRADAY 60min ────────────────────
 async function fetchAVIntraday(asset) {
-  // Serve from cache if still fresh
+  // Fresh cache — load candles or restore last-close snapshot
   if (avCacheFresh(asset)) {
-    if (avCache.data[asset]?.candles) loadIntoPd(asset, avCache.data[asset].candles);
+    const entry = avCache.data[asset];
+    if (entry?.candles) {
+      loadIntoPd(asset, entry.candles);
+      // Re-populate livePrices if state was reset (e.g. fresh restart loaded state.json)
+      if (!state.livePrices[asset]?.price) {
+        const last   = entry.candles[entry.candles.length - 1];
+        const prev24 = entry.candles[Math.max(0, entry.candles.length - 25)];
+        state.livePrices[asset] = {
+          price:       last.close,
+          change24h:   prev24.close > 0 ? (last.close - prev24.close) / prev24.close * 100 : 0,
+          high24h:     Math.max(...entry.candles.slice(-24).map(c => c.high)),
+          low24h:      Math.min(...entry.candles.slice(-24).map(c => c.low)),
+          isLastClose: false,
+        };
+      }
+    } else if (entry?.fallbackPrice) {
+      _restoreLastClose(asset, entry);
+    }
     return true;
   }
-  // Serve stale cache when budget is gone
+
+  // Budget exhausted — serve whatever cache we have
   if (!avBudgetOk()) {
     log(`[AV] Budget exhausted (${avCache.dailyCalls}/${AV_DAILY_LIMIT}) — using cached data for ${asset}`);
-    if (avCache.data[asset]?.candles) loadIntoPd(asset, avCache.data[asset].candles);
+    const entry = avCache.data[asset];
+    if (entry?.candles)       loadIntoPd(asset, entry.candles);
+    else if (entry?.fallbackPrice) _restoreLastClose(asset, entry);
     return false;
   }
   if (!avKey()) { log(`[AV] ALPHA_VANTAGE_KEY not set — skipping ${asset}`); return false; }
@@ -280,10 +371,17 @@ async function fetchAVIntraday(asset) {
     const url = `https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol=${asset}&interval=60min&outputsize=full&apikey=${avKey()}`;
     const data = await httpsGetJSON(url);
 
-    // AV returns a Note or Information field when rate-limited or on invalid key
+    // AV rate-limit or auth error
     if (data.Note || data.Information) {
       log(`[AV] ${asset} API message: ${(data.Note || data.Information).slice(0, 100)}`);
-      if (avCache.data[asset]?.candles) loadIntoPd(asset, avCache.data[asset].candles);
+      const entry = avCache.data[asset];
+      if (entry?.candles)            loadIntoPd(asset, entry.candles);
+      else if (entry?.fallbackPrice) _restoreLastClose(asset, entry);
+      else if (avBudgetOk()) {
+        log(`[AV] ${asset}: rate-limited + no cache, trying GLOBAL_QUOTE fallback`);
+        await delay(AV_CALL_GAP_MS);
+        await _applyGlobalQuoteFallback(asset, asset);
+      }
       return false;
     }
 
@@ -292,7 +390,7 @@ async function fetchAVIntraday(asset) {
 
     const candles = Object.entries(series)
       .map(([dt, v]) => ({
-        ts:     new Date(dt).getTime(),   // AV timestamps: "2024-01-15 16:00:00" (US Eastern)
+        ts:     new Date(dt).getTime(),
         open:   +v['1. open'],
         high:   +v['2. high'],
         low:    +v['3. low'],
@@ -312,16 +410,27 @@ async function fetchAVIntraday(asset) {
     const last   = candles[candles.length - 1];
     const prev24 = candles[Math.max(0, candles.length - 25)];
     state.livePrices[asset] = {
-      price:     last.close,
-      change24h: prev24.close > 0 ? (last.close - prev24.close) / prev24.close * 100 : 0,
-      high24h:   Math.max(...candles.slice(-24).map(c => c.high)),
-      low24h:    Math.min(...candles.slice(-24).map(c => c.low)),
+      price:       last.close,
+      change24h:   prev24.close > 0 ? (last.close - prev24.close) / prev24.close * 100 : 0,
+      high24h:     Math.max(...candles.slice(-24).map(c => c.high)),
+      low24h:      Math.min(...candles.slice(-24).map(c => c.low)),
+      isLastClose: false,
     };
     log(`[AV] ${asset}: ${candles.length} candles, last=$${last.close.toFixed(2)}`);
     return true;
   } catch(e) {
     log(`[AV] ${asset} intraday error: ${e.message}`);
-    if (avCache.data[asset]?.candles) loadIntoPd(asset, avCache.data[asset].candles);
+    const entry = avCache.data[asset];
+    if (entry?.candles) {
+      loadIntoPd(asset, entry.candles);
+    } else if (entry?.fallbackPrice) {
+      _restoreLastClose(asset, entry);
+    } else {
+      // No cache at all (first run on a weekend/holiday) — fetch last close via GLOBAL_QUOTE
+      log(`[AV] ${asset}: no cache available, falling back to GLOBAL_QUOTE for last close`);
+      await delay(AV_CALL_GAP_MS);
+      await _applyGlobalQuoteFallback(asset, asset);
+    }
     return false;
   }
 }
@@ -333,49 +442,55 @@ async function fetchAVGlobalQuote(asset) {
   const avSym = AV_COMMODITY_PROXY[asset];
   if (!avSym) return false;
 
-  if (avCacheFresh(asset)) return true; // price was appended on the last call
+  // Fresh cache — ensure livePrices is populated in case state was reset
+  if (avCacheFresh(asset)) {
+    if (avCache.data[asset]?.fallbackPrice) _restoreLastClose(asset, avCache.data[asset]);
+    return true;
+  }
 
   if (!avBudgetOk()) {
     log(`[AV] Budget exhausted (${avCache.dailyCalls}/${AV_DAILY_LIMIT}) — keeping last price for ${asset}`);
+    if (avCache.data[asset]?.fallbackPrice) _restoreLastClose(asset, avCache.data[asset]);
     return false;
   }
   if (!avKey()) { log(`[AV] ALPHA_VANTAGE_KEY not set — skipping ${asset}`); return false; }
 
   try {
-    const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${avSym}&apikey=${avKey()}`;
-    const data = await httpsGetJSON(url);
+    const quote = await _doGlobalQuoteFetch(avSym);
+    if (!quote) throw new Error('Empty Global Quote response');
 
-    if (data.Note || data.Information) {
-      log(`[AV] ${asset} (${avSym}) API message: ${(data.Note || data.Information).slice(0, 100)}`);
-      return false;
-    }
-
-    const q = data['Global Quote'];
-    if (!q?.['05. price']) throw new Error('Empty Global Quote response');
-
-    const price  = +q['05. price'];
-    const open   = +q['02. open']   || price;
-    const high   = +q['03. high']   || price;
-    const low    = +q['04. low']    || price;
-    const volume = +q['06. volume'] || 0;
-    const chgPct = parseFloat(q['10. change percent']) || 0;
-
-    // Append snapshot to the running price history (builds indicators over time)
+    // Append snapshot to running price history (builds indicators over time)
     const d = pd[asset];
     d.timestamps.push(Date.now());
-    d.opens.push(open); d.highs.push(high); d.lows.push(low);
-    d.closes.push(price); d.volumes.push(volume);
+    d.opens.push(quote.open); d.highs.push(quote.high); d.lows.push(quote.low);
+    d.closes.push(quote.price); d.volumes.push(quote.volume);
     for (const k of ['closes','highs','lows','opens','volumes','timestamps'])
       if (d[k].length > MAX_CANDLES) d[k] = d[k].slice(-MAX_CANDLES);
 
-    avCache.data[asset] = { fetchedAt: Date.now(), price, avSym };
+    // Persist enough data to _restoreLastClose can reconstruct price on restart
+    avCache.data[asset] = {
+      fetchedAt:     Date.now(),
+      fallbackPrice: quote.price,
+      high:          quote.high,
+      low:           quote.low,
+      chgPct:        quote.chgPct,
+      avSym,
+      isLastClose:   true,
+    };
     avRecordCall();
 
-    state.livePrices[asset] = { price, change24h: chgPct, high24h: high, low24h: low };
-    log(`[AV] ${asset} (${avSym}): $${price.toFixed(2)} ${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}%`);
+    state.livePrices[asset] = {
+      price:       quote.price,
+      change24h:   quote.chgPct,
+      high24h:     quote.high,
+      low24h:      quote.low,
+      isLastClose: true,
+    };
+    log(`[AV] ${asset} (${avSym}): $${quote.price.toFixed(2)} ${quote.chgPct >= 0 ? '+' : ''}${quote.chgPct.toFixed(2)}%`);
     return true;
   } catch(e) {
     log(`[AV] ${asset} quote error: ${e.message}`);
+    if (avCache.data[asset]?.fallbackPrice) _restoreLastClose(asset, avCache.data[asset]);
     return false;
   }
 }
@@ -1506,6 +1621,39 @@ async function start() {
       await runBacktest();
     } catch(e) { log(`[BACKTEST] Weekly error: ${e.message}`); }
   }, 7 * 24 * 3600_000);
+
+  // Daily analyst report at 08:00 UTC
+  (function scheduleAnalyst() {
+    let analyst;
+    try { analyst = require('./analyst'); } catch(e) { log(`[ANALYST] Module load failed: ${e.message}`); return; }
+
+    const runReport = async () => {
+      try { await analyst.generateDailyReport(); }
+      catch(e) { log(`[ANALYST] Report error: ${e.message}`); }
+    };
+
+    // Run on startup if no report for today
+    if (!analyst.todayHasReport()) {
+      log('[ANALYST] No report for today — generating startup report');
+      runReport();
+    }
+
+    // Schedule precise 08:00 UTC daily trigger
+    function msUntil8amUTC() {
+      const now  = new Date();
+      const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 8, 0, 0, 0));
+      if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+      return next - now;
+    }
+
+    function scheduleNext() {
+      const delay = msUntil8amUTC();
+      log(`[ANALYST] Next report scheduled in ${Math.round(delay/3600000*10)/10}h (08:00 UTC)`);
+      setTimeout(() => { runReport(); setInterval(runReport, 24 * 3600_000); }, delay);
+    }
+
+    scheduleNext();
+  })();
 
   log('[APEX] All schedulers running. Bot is live.');
 }
