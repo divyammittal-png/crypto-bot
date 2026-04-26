@@ -1113,11 +1113,11 @@ async function loadAnalystReport() {
 
     const bodyHtml = (report.text || '')
       .replace(/^## (.+)$/gm, '<h2>$1</h2>')
-      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
       .replace(/^- (.+)$/gm, '<li>$1</li>')
-      .replace(/(<li>[\s\S]*?<\/li>)+/g, m => \`<ul>\${m}</ul>\`)
-      .replace(/\n{2,}/g, '</p><p>')
-      .replace(/\n/g, '<br>');
+      .replace(/(<li>[\\s\\S]*?<\\/li>)+/g, m => \`<ul>\${m}</ul>\`)
+      .replace(/\\n{2,}/g, '</p><p>')
+      .replace(/\\n/g, '<br>');
 
     const cfgBlock = report.configChangesApplied ? \`
       <div class="config-applied">
