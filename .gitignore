@@ -1,4 +1,15 @@
 node_modules/
-trades.json
-state.json
 *.log
+
+# Runtime data — never commit these
+state.json
+trades.json
+learning.json
+strategy-weights.json
+config.json
+config-log.json
+reports.json
+analyst-reports.json
+backtest-results.json
+sentiment.json
+av-cache.json
