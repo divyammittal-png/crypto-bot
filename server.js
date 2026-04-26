@@ -377,7 +377,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
         <div class="risk-val" id="g-var">—</div>
         <div class="gauge-bar"><div class="gauge-fill" id="g-var-bar" style="background:var(--blue);width:0%"></div></div>
       </div>
-      <div class="risk-card">
+      <div class="risk-card" title="Multiple positions moving together — new position sizes auto-reduced 50%">
         <div class="risk-label">Corr. Risk</div>
         <div class="risk-val" id="g-corr">—</div>
         <div class="gauge-bar"><div class="gauge-fill" id="g-corr-bar" style="background:var(--purple,#805ad5);width:0%"></div></div>
@@ -915,9 +915,9 @@ function updateRiskGauges(state, trades) {
   const openCount = Object.values(ports).reduce((s,p)=>s+(p.positions||[]).length,0);
   const corrRisk  = openCount >= 5;
   document.getElementById('g-corr').textContent = corrRisk ? 'HIGH' : 'LOW';
-  document.getElementById('g-corr').style.color = corrRisk ? 'var(--red)' : 'var(--green)';
+  document.getElementById('g-corr').style.color = corrRisk ? 'var(--yellow)' : 'var(--green)';
   document.getElementById('g-corr-bar').style.width = corrRisk ? '80%' : '20%';
-  document.getElementById('g-corr-bar').style.background = corrRisk ? 'var(--red)' : 'var(--green)';
+  document.getElementById('g-corr-bar').style.background = corrRisk ? 'var(--yellow)' : 'var(--green)';
 }
 
 function setGauge(valId, val, barId, pct, maxPct) {
