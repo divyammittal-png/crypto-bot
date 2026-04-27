@@ -42,10 +42,7 @@ for (const [cls, arr] of Object.entries(CLASSES)) arr.forEach(a => ASSET_CLASS[a
 
 const CG_IDS = { BTC:'bitcoin',ETH:'ethereum',SOL:'solana',BNB:'binancecoin',XRP:'ripple' };
 
-// Alpha Vantage — commodity futures mapped to liquid ETF proxies for GLOBAL_QUOTE
-const AV_COMMODITY_PROXY = { 'GC=F':'GLD', 'SI=F':'SLV', 'CL=F':'USO', 'NG=F':'UNG' };
-const AV_DAILY_LIMIT  = 25;
-const AV_CALL_GAP_MS  = 13_000; // free tier: 5 req/min → 12s gap + 1s buffer
+const YF_CACHE_TTL = 4 * 60_000; // 4 min — just under the 5-min polling interval
 
 // ─── STAT-ARB PAIRS ──────────────────────────────────────────────────────────
 const PAIRS = [
@@ -93,8 +90,8 @@ let lastRegimeUpdate     = 0;
 let lastLearningCycle    = 0;
 let lastMultiFactorReb   = 0;
 let lastAllWeatherReb    = 0;
-// Alpha Vantage on-disk cache — persists across restarts to protect daily budget
-let avCache = { data:{}, dailyCalls:0, dailyDate:'' };
+// Yahoo Finance on-disk cache — persists across restarts so prices survive redeploys
+let yfCache = { data:{} };
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -179,30 +176,12 @@ async function httpsGetJSON(url, opts = {}) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// DATA FETCHING — CoinGecko (crypto) + Alpha Vantage (equities/commodities)
+// DATA FETCHING — CoinGecko (crypto) + Yahoo Finance (equities/commodities)
 // ──────────────────────────────────────────────────────────────────────────────
 
-// ─── ALPHA VANTAGE BUDGET HELPERS ─────────────────────────────────────────────
-function avKey() { return process.env.ALPHA_VANTAGE_KEY || ''; }
-
-function avBudgetOk() {
-  const today = new Date().toISOString().slice(0, 10);
-  if (avCache.dailyDate !== today) { avCache.dailyCalls = 0; avCache.dailyDate = today; }
-  return avCache.dailyCalls < AV_DAILY_LIMIT;
-}
-
-function avRecordCall() {
-  const today = new Date().toISOString().slice(0, 10);
-  if (avCache.dailyDate !== today) { avCache.dailyCalls = 0; avCache.dailyDate = today; }
-  avCache.dailyCalls++;
-  saveJSON(F.avCache, avCache);
-  log(`[AV] Budget: ${avCache.dailyCalls}/${AV_DAILY_LIMIT} calls used today`);
-}
-
-// Cache is fresh if fetched within the last hour
-function avCacheFresh(asset) {
-  const entry = avCache.data?.[asset];
-  return !!(entry && (Date.now() - entry.fetchedAt) < 3_600_000);
+function yfCacheFresh(asset) {
+  const entry = yfCache.data?.[asset];
+  return !!(entry?.candles?.length && (Date.now() - entry.fetchedAt) < YF_CACHE_TTL);
 }
 
 // Copy candle array into the pd[asset] in-memory store
@@ -265,261 +244,90 @@ async function fetchCGOHLC(asset) {
   }
 }
 
-// ─── SHARED: raw GLOBAL_QUOTE API call ───────────────────────────────────────
-async function _doGlobalQuoteFetch(avSym) {
-  const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(avSym)}&apikey=${avKey()}`;
-  const data = await httpsGetJSON(url);
-  if (data.Note || data.Information) {
-    log(`[AV] GLOBAL_QUOTE ${avSym}: ${(data.Note || data.Information).slice(0, 80)}`);
-    return null;
-  }
-  const q = data['Global Quote'];
-  if (!q?.['05. price']) return null;
-  return {
-    price:  +q['05. price'],
-    open:   +q['02. open']   || +q['05. price'],
-    high:   +q['03. high']   || +q['05. price'],
-    low:    +q['04. low']    || +q['05. price'],
-    volume: +q['06. volume'] || 0,
-    chgPct: parseFloat(q['10. change percent']) || 0,
-  };
-}
+// ─── YAHOO FINANCE: EQUITIES + COMMODITIES — 1h candles, 30 days ─────────────
 
-// ─── SHARED: restore a cached last-close snapshot into live state + pd ────────
-// Called on restart and whenever intraday data is unavailable.
-function _restoreLastClose(asset, entry) {
-  if (!entry?.fallbackPrice) return;
+function _populateLivePrices(asset, entry) {
+  if (!entry?.candles?.length) return;
+  const candles = entry.candles;
+  const last   = candles[candles.length - 1];
+  const prev24 = candles[Math.max(0, candles.length - 25)];
   state.livePrices[asset] = {
-    price:       entry.fallbackPrice,
-    change24h:   entry.chgPct  || 0,
-    high24h:     entry.high    || entry.fallbackPrice,
-    low24h:      entry.low     || entry.fallbackPrice,
-    isLastClose: true,
+    price:       entry.regularMarketPrice || last.close,
+    change24h:   prev24.close > 0 ? (last.close - prev24.close) / prev24.close * 100 : 0,
+    high24h:     Math.max(...candles.slice(-24).map(c => c.high)),
+    low24h:      Math.min(...candles.slice(-24).map(c => c.low)),
+    isLastClose: false,
   };
-  // Inject one synthetic candle so getCurrentPrice() returns a non-zero value
-  if (pd[asset].closes.length === 0) {
-    const d = pd[asset];
-    const ts = entry.fetchedAt || Date.now();
-    d.timestamps.push(ts);
-    d.opens.push(entry.fallbackPrice);
-    d.highs.push(entry.high  || entry.fallbackPrice);
-    d.lows.push( entry.low   || entry.fallbackPrice);
-    d.closes.push(entry.fallbackPrice);
-    d.volumes.push(0);
-  }
-  log(`[AV] ${asset}: restored last close $${entry.fallbackPrice.toFixed(2)} from cache (isLastClose)`);
 }
 
-// ─── SHARED: fetch GLOBAL_QUOTE, persist to cache, restore into state ─────────
-// Used both as commodity primary fetch and as equity intraday fallback.
-async function _applyGlobalQuoteFallback(asset, avSym) {
-  if (!avBudgetOk() || !avKey()) return false;
-  try {
-    const quote = await _doGlobalQuoteFetch(avSym);
-    if (!quote) return false;
-    const entry = {
-      fetchedAt:     Date.now(),
-      fallbackPrice: quote.price,
-      high:          quote.high,
-      low:           quote.low,
-      chgPct:        quote.chgPct,
-      avSym,
-      isLastClose:   true,
-    };
-    avCache.data[asset] = entry;
-    avRecordCall();
-    _restoreLastClose(asset, entry);
-    return true;
-  } catch(e) {
-    log(`[AV] ${asset} GLOBAL_QUOTE fallback error: ${e.message}`);
-    return false;
-  }
-}
-
-// ─── ALPHA VANTAGE: EQUITIES — TIME_SERIES_INTRADAY 60min ────────────────────
-async function fetchAVIntraday(asset) {
-  // Fresh cache — load candles or restore last-close snapshot
-  if (avCacheFresh(asset)) {
-    const entry = avCache.data[asset];
-    if (entry?.candles) {
-      loadIntoPd(asset, entry.candles);
-      // Re-populate livePrices if state was reset (e.g. fresh restart loaded state.json)
-      if (!state.livePrices[asset]?.price) {
-        const last   = entry.candles[entry.candles.length - 1];
-        const prev24 = entry.candles[Math.max(0, entry.candles.length - 25)];
-        state.livePrices[asset] = {
-          price:       last.close,
-          change24h:   prev24.close > 0 ? (last.close - prev24.close) / prev24.close * 100 : 0,
-          high24h:     Math.max(...entry.candles.slice(-24).map(c => c.high)),
-          low24h:      Math.min(...entry.candles.slice(-24).map(c => c.low)),
-          isLastClose: false,
-        };
-      }
-    } else if (entry?.fallbackPrice) {
-      _restoreLastClose(asset, entry);
-    }
+async function fetchYahooChart(asset) {
+  if (yfCacheFresh(asset)) {
+    const entry = yfCache.data[asset];
+    loadIntoPd(asset, entry.candles);
+    if (!state.livePrices[asset]?.price) _populateLivePrices(asset, entry);
     return true;
   }
 
-  // Budget exhausted — serve whatever cache we have
-  if (!avBudgetOk()) {
-    log(`[AV] Budget exhausted (${avCache.dailyCalls}/${AV_DAILY_LIMIT}) — using cached data for ${asset}`);
-    const entry = avCache.data[asset];
-    if (entry?.candles)       loadIntoPd(asset, entry.candles);
-    else if (entry?.fallbackPrice) _restoreLastClose(asset, entry);
-    return false;
-  }
-  if (!avKey()) { log(`[AV] ALPHA_VANTAGE_KEY not set — skipping ${asset}`); return false; }
-
   try {
-    const url = `https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol=${asset}&interval=60min&outputsize=full&apikey=${avKey()}`;
-    const data = await httpsGetJSON(url);
+    const url = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(asset)}?interval=1h&range=30d&region=US&lang=en-US`;
+    const data = await httpsGetJSON(url, { headers: { 'User-Agent': UA } });
 
-    // AV rate-limit or auth error
-    if (data.Note || data.Information) {
-      log(`[AV] ${asset} API message: ${(data.Note || data.Information).slice(0, 100)}`);
-      const entry = avCache.data[asset];
-      if (entry?.candles)            loadIntoPd(asset, entry.candles);
-      else if (entry?.fallbackPrice) _restoreLastClose(asset, entry);
-      else if (avBudgetOk()) {
-        log(`[AV] ${asset}: rate-limited + no cache, trying GLOBAL_QUOTE fallback`);
-        await delay(AV_CALL_GAP_MS);
-        await _applyGlobalQuoteFallback(asset, asset);
-      }
-      return false;
-    }
+    const result = data?.chart?.result?.[0];
+    if (!result) throw new Error('No chart result in Yahoo Finance response');
 
-    const series = data['Time Series (60min)'];
-    if (!series) throw new Error(`Unexpected response keys: ${Object.keys(data).join(', ')}`);
+    const timestamps = result.timestamp || [];
+    const quote      = result.indicators?.quote?.[0] || {};
+    const regularMarketPrice = result.meta?.regularMarketPrice;
 
-    const candles = Object.entries(series)
-      .map(([dt, v]) => ({
-        ts:     new Date(dt).getTime(),
-        open:   +v['1. open'],
-        high:   +v['2. high'],
-        low:    +v['3. low'],
-        close:  +v['4. close'],
-        volume: +v['5. volume'],
+    const candles = timestamps
+      .map((ts, i) => ({
+        ts:     ts * 1000,
+        open:   quote.open?.[i],
+        high:   quote.high?.[i],
+        low:    quote.low?.[i],
+        close:  quote.close?.[i],
+        volume: quote.volume?.[i] ?? 0,
       }))
-      .filter(c => c.close > 0 && !isNaN(c.close))
-      .sort((a, b) => a.ts - b.ts)
+      .filter(c => c.close != null && c.close > 0 && !isNaN(c.close))
       .slice(-MAX_CANDLES);
 
     if (candles.length === 0) throw new Error('No valid candles after parsing');
 
-    avCache.data[asset] = { candles, fetchedAt: Date.now() };
-    avRecordCall();
+    yfCache.data[asset] = { candles, fetchedAt: Date.now(), regularMarketPrice };
+    saveJSON(F.avCache, yfCache);
     loadIntoPd(asset, candles);
+    _populateLivePrices(asset, yfCache.data[asset]);
 
-    const last   = candles[candles.length - 1];
-    const prev24 = candles[Math.max(0, candles.length - 25)];
-    state.livePrices[asset] = {
-      price:       last.close,
-      change24h:   prev24.close > 0 ? (last.close - prev24.close) / prev24.close * 100 : 0,
-      high24h:     Math.max(...candles.slice(-24).map(c => c.high)),
-      low24h:      Math.min(...candles.slice(-24).map(c => c.low)),
-      isLastClose: false,
-    };
-    log(`[AV] ${asset}: ${candles.length} candles, last=$${last.close.toFixed(2)}`);
+    const last = candles[candles.length - 1];
+    log(`[YF] ${asset}: ${candles.length} candles, last=$${(regularMarketPrice || last.close).toFixed(2)}`);
     return true;
   } catch(e) {
-    log(`[AV] ${asset} intraday error: ${e.message}`);
-    const entry = avCache.data[asset];
-    if (entry?.candles) {
+    log(`[YF] ${asset} error: ${e.message}`);
+    const entry = yfCache.data[asset];
+    if (entry?.candles?.length) {
       loadIntoPd(asset, entry.candles);
-    } else if (entry?.fallbackPrice) {
-      _restoreLastClose(asset, entry);
-    } else {
-      // No cache at all (first run on a weekend/holiday) — fetch last close via GLOBAL_QUOTE
-      log(`[AV] ${asset}: no cache available, falling back to GLOBAL_QUOTE for last close`);
-      await delay(AV_CALL_GAP_MS);
-      await _applyGlobalQuoteFallback(asset, asset);
+      if (!state.livePrices[asset]?.price) _populateLivePrices(asset, entry);
     }
-    return false;
-  }
-}
-
-// ─── ALPHA VANTAGE: COMMODITIES — GLOBAL_QUOTE ───────────────────────────────
-// Commodity futures are mapped to their ETF proxies (GC=F→GLD, etc.)
-// GLOBAL_QUOTE returns a single snapshot; we accumulate a price history over time.
-async function fetchAVGlobalQuote(asset) {
-  const avSym = AV_COMMODITY_PROXY[asset];
-  if (!avSym) return false;
-
-  // Fresh cache — ensure livePrices is populated in case state was reset
-  if (avCacheFresh(asset)) {
-    if (avCache.data[asset]?.fallbackPrice) _restoreLastClose(asset, avCache.data[asset]);
-    return true;
-  }
-
-  if (!avBudgetOk()) {
-    log(`[AV] Budget exhausted (${avCache.dailyCalls}/${AV_DAILY_LIMIT}) — keeping last price for ${asset}`);
-    if (avCache.data[asset]?.fallbackPrice) _restoreLastClose(asset, avCache.data[asset]);
-    return false;
-  }
-  if (!avKey()) { log(`[AV] ALPHA_VANTAGE_KEY not set — skipping ${asset}`); return false; }
-
-  try {
-    const quote = await _doGlobalQuoteFetch(avSym);
-    if (!quote) throw new Error('Empty Global Quote response');
-
-    // Append snapshot to running price history (builds indicators over time)
-    const d = pd[asset];
-    d.timestamps.push(Date.now());
-    d.opens.push(quote.open); d.highs.push(quote.high); d.lows.push(quote.low);
-    d.closes.push(quote.price); d.volumes.push(quote.volume);
-    for (const k of ['closes','highs','lows','opens','volumes','timestamps'])
-      if (d[k].length > MAX_CANDLES) d[k] = d[k].slice(-MAX_CANDLES);
-
-    // Persist enough data to _restoreLastClose can reconstruct price on restart
-    avCache.data[asset] = {
-      fetchedAt:     Date.now(),
-      fallbackPrice: quote.price,
-      high:          quote.high,
-      low:           quote.low,
-      chgPct:        quote.chgPct,
-      avSym,
-      isLastClose:   true,
-    };
-    avRecordCall();
-
-    state.livePrices[asset] = {
-      price:       quote.price,
-      change24h:   quote.chgPct,
-      high24h:     quote.high,
-      low24h:      quote.low,
-      isLastClose: true,
-    };
-    log(`[AV] ${asset} (${avSym}): $${quote.price.toFixed(2)} ${quote.chgPct >= 0 ? '+' : ''}${quote.chgPct.toFixed(2)}%`);
-    return true;
-  } catch(e) {
-    log(`[AV] ${asset} quote error: ${e.message}`);
-    if (avCache.data[asset]?.fallbackPrice) _restoreLastClose(asset, avCache.data[asset]);
     return false;
   }
 }
 
 // ─── REFRESH ORCHESTRATION ────────────────────────────────────────────────────
 
-// Startup: walk all equities then commodities, respecting budget and 1h cache TTL.
-// Stale cache from a previous run is loaded first — avoids wasting calls on restart.
 async function startupFetch() {
-  if (!avKey()) {
-    log('[AV] ALPHA_VANTAGE_KEY not set — equity/commodity price data will be unavailable');
-    return;
+  log('[YF] Starting Yahoo Finance fetch for equities + commodities...');
+  for (const asset of [...CLASSES.equities, ...CLASSES.commodities]) {
+    await fetchYahooChart(asset);
+    await delay(300);
   }
-  const today = new Date().toISOString().slice(0, 10);
-  log(`[AV] Startup fetch — ${avCache.dailyCalls}/${AV_DAILY_LIMIT} calls used today (${today})`);
+  log('[YF] Startup fetch complete');
+}
 
-  for (const asset of CLASSES.equities) {
-    await fetchAVIntraday(asset);
-    if (!avCacheFresh(asset)) await delay(AV_CALL_GAP_MS); // only pause after a live API call
+async function refreshEquitiesAndCommodities() {
+  for (const asset of [...CLASSES.equities, ...CLASSES.commodities]) {
+    await fetchYahooChart(asset);
+    await delay(300);
   }
-  for (const asset of CLASSES.commodities) {
-    await fetchAVGlobalQuote(asset);
-    if (!avCacheFresh(asset)) await delay(AV_CALL_GAP_MS);
-  }
-  log(`[AV] Startup fetch complete — budget remaining: ${AV_DAILY_LIMIT - avCache.dailyCalls}`);
 }
 
 // Crypto refresh: CoinGecko live prices + OHLC history
@@ -531,27 +339,6 @@ async function refreshCrypto() {
   }
 }
 
-// Rolling AV refresh: pick the single stalest non-crypto asset and refresh it.
-// One call per invocation — naturally caps daily usage well within 25/day.
-async function rollingAvRefresh() {
-  if (!avBudgetOk()) {
-    log(`[AV] Daily budget exhausted (${avCache.dailyCalls}/${AV_DAILY_LIMIT}) — no refresh this cycle`);
-    return;
-  }
-  const nonCrypto = [...CLASSES.equities, ...CLASSES.commodities];
-  let stale = null, oldestFetch = Infinity;
-  for (const asset of nonCrypto) {
-    const fetched = avCache.data?.[asset]?.fetchedAt ?? 0;
-    if (fetched < oldestFetch) { oldestFetch = fetched; stale = asset; }
-  }
-  if (!stale) return;
-  const ageMin = Math.floor((Date.now() - oldestFetch) / 60_000);
-  if (ageMin < 60) { log(`[AV] All caches fresh — oldest is ${stale} at ${ageMin}min`); return; }
-
-  log(`[AV] Rolling refresh: ${stale} (${ageMin}min old)`);
-  if (CLASSES.equities.includes(stale)) await fetchAVIntraday(stale);
-  else await fetchAVGlobalQuote(stale);
-}
 
 function getCurrentPrice(asset) {
   return state.livePrices[asset]?.price || pd[asset].closes[pd[asset].closes.length - 1] || 0;
@@ -1199,7 +986,8 @@ function closePosition(profile, posId, reason) {
     ? (exitPrice - pos.entryPrice) * pos.qty
     : (pos.entryPrice - exitPrice) * pos.qty;
   const pnlPct = (pnl / pos.notional) * 100;
-  const win  = pnl > 0;
+  const win    = pnl >= 0;
+  const result = pnl > 0 ? 'WIN' : pnl < 0 ? 'LOSS' : 'BREAKEVEN';
 
   const openedMs  = new Date(pos.openedAt).getTime();
   const holdMins  = (Date.now() - openedMs) / 60000;
@@ -1211,7 +999,7 @@ function closePosition(profile, posId, reason) {
   const closedTrade = {
     ...pos,
     exitPrice, pnl: +pnl.toFixed(4), pnlPct: +pnlPct.toFixed(4),
-    win, exitReason: reason, closedAt: now(), holdDurationMinutes: +holdMins.toFixed(0),
+    win, result, exitReason: reason, closedAt: now(), holdDurationMinutes: +holdMins.toFixed(0),
   };
 
   allTrades.push(closedTrade);
@@ -1542,15 +1330,15 @@ async function start() {
   // Write default config if none exists
   if (!loadJSON(F.config)) saveJSON(F.config, DEFAULT_CONFIG);
 
-  // Load AV on-disk cache (survives restarts — protects 25/day budget)
-  avCache = loadJSON(F.avCache) || { data:{}, dailyCalls:0, dailyDate:'' };
+  // Load Yahoo Finance on-disk cache (survives restarts)
+  yfCache = loadJSON(F.avCache) || { data:{} };
 
   // Initial data load
   log('[APEX] Loading crypto OHLC from CoinGecko...');
   await fetchCoinGeckoLive();
   for (const asset of CLASSES.crypto) { await fetchCGOHLC(asset); await delay(2000); }
 
-  log('[APEX] Loading equities + commodities from Alpha Vantage...');
+  log('[APEX] Loading equities + commodities from Yahoo Finance...');
   await startupFetch();
 
   // Initial regime detection
@@ -1591,12 +1379,11 @@ async function start() {
     } catch(e) { log(`[LOOP] CG OHLC tick error: ${e.message}`); }
   }, 5 * 60_000);
 
-  // Equities/Commodities: rolling AV refresh every 60 minutes (one asset per cycle)
-  // Max 24 calls/day from this loop; combined with startup stays under 25/day limit.
+  // Equities/Commodities: Yahoo Finance refresh every 5 minutes
   setInterval(async () => {
-    try { await rollingAvRefresh(); await tick(); }
-    catch(e) { log(`[LOOP] AV refresh error: ${e.message}`); }
-  }, 60 * 60_000);
+    try { await refreshEquitiesAndCommodities(); await tick(); }
+    catch(e) { log(`[LOOP] YF refresh error: ${e.message}`); }
+  }, 5 * 60_000);
 
   // Sentiment: every 4 hours
   setInterval(async () => {
