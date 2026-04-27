@@ -27,30 +27,22 @@ const F = {
   config:   dataPath('config.json'),
   configLog:dataPath('config-log.json'),
   backtest: dataPath('backtest-results.json'),
-  avCache:      dataPath('av-cache.json'),
   priceHistory: dataPath('price-history.json'),
 };
 
 // ─── ASSET UNIVERSE ───────────────────────────────────────────────────────────
 const CLASSES = {
-  crypto:      ['BTC','ETH','SOL','BNB','XRP'],
-  equities:    ['AAPL','TSLA','NVDA','SPY','AMZN','MSFT','GOOGL','META','NFLX','JPM','QQQ'],
-  commodities: ['GC=F','SI=F','CL=F','NG=F'],
+  crypto: ['BTC','ETH','SOL','BNB','XRP'],
 };
-const ALL_ASSETS = [...CLASSES.crypto, ...CLASSES.equities, ...CLASSES.commodities];
+const ALL_ASSETS = [...CLASSES.crypto];
 const ASSET_CLASS = {};
 for (const [cls, arr] of Object.entries(CLASSES)) arr.forEach(a => ASSET_CLASS[a] = cls);
 
 const CG_IDS = { BTC:'bitcoin',ETH:'ethereum',SOL:'solana',BNB:'binancecoin',XRP:'ripple' };
 
-const YF_CACHE_TTL = 4 * 60_000; // 4 min — just under the 5-min polling interval
-
 // ─── STAT-ARB PAIRS ──────────────────────────────────────────────────────────
 const PAIRS = [
-  ['BTC','ETH'],['BTC','SOL'],
-  ['AAPL','MSFT'],['GOOGL','META'],
-  ['NVDA','SPY'],
-  ['GC=F','SI=F'],['CL=F','NG=F'],
+  ['BTC','ETH'],['BTC','SOL'],['ETH','SOL'],['BNB','ETH'],
 ];
 
 // ─── RISK PROFILES ────────────────────────────────────────────────────────────
@@ -68,7 +60,7 @@ const DEFAULT_CONFIG = {
   macdFast:12, macdSlow:26, riskReward:3,
   maxTradeRisk:1.0, kellyFraction:50,
   killSwitchThreshold:-20, maxPortfolioHeat:60, cashBuffer:20,
-  cryptoMax:40, equitiesMax:50, commoditiesMax:30,
+  cryptoMax:100,
   enabledAssets: Object.fromEntries(ALL_ASSETS.map(a => [a, true])),
 };
 
@@ -91,10 +83,6 @@ let lastRegimeUpdate     = 0;
 let lastLearningCycle    = 0;
 let lastMultiFactorReb   = 0;
 let lastAllWeatherReb    = 0;
-// Yahoo Finance on-disk cache — persists across restarts so prices survive redeploys
-let yfCache = { data:{} };
-
-const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // HELPERS
@@ -177,13 +165,8 @@ async function httpsGetJSON(url, opts = {}) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// DATA FETCHING — CoinGecko (crypto) + Yahoo Finance (equities/commodities)
+// DATA FETCHING — CoinGecko (crypto)
 // ──────────────────────────────────────────────────────────────────────────────
-
-function yfCacheFresh(asset) {
-  const entry = yfCache.data?.[asset];
-  return !!(entry?.candles?.length && (Date.now() - entry.fetchedAt) < YF_CACHE_TTL);
-}
 
 // Copy candle array into the pd[asset] in-memory store
 function loadIntoPd(asset, candles) {
@@ -245,102 +228,6 @@ async function fetchCGOHLC(asset) {
     return false;
   }
 }
-
-// ─── YAHOO FINANCE: EQUITIES + COMMODITIES — 1h candles, 30 days ─────────────
-
-function _populateLivePrices(asset, entry) {
-  if (!entry?.candles?.length) return;
-  const candles = entry.candles;
-  const last   = candles[candles.length - 1];
-  const prev24 = candles[Math.max(0, candles.length - 25)];
-  state.livePrices[asset] = {
-    price:       entry.regularMarketPrice || last.close,
-    change24h:   prev24.close > 0 ? (last.close - prev24.close) / prev24.close * 100 : 0,
-    high24h:     Math.max(...candles.slice(-24).map(c => c.high)),
-    low24h:      Math.min(...candles.slice(-24).map(c => c.low)),
-    isLastClose: false,
-  };
-}
-
-async function fetchYahooChart(asset) {
-  if (yfCacheFresh(asset)) {
-    const entry = yfCache.data[asset];
-    loadIntoPd(asset, entry.candles);
-    if (!state.livePrices[asset]?.price) _populateLivePrices(asset, entry);
-    return true;
-  }
-
-  try {
-    const url = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(asset)}?interval=1h&range=30d&region=US&lang=en-US`;
-    const data = await httpsGetJSON(url, { headers: { 'User-Agent': UA } });
-
-    const result = data?.chart?.result?.[0];
-    if (!result) throw new Error('No chart result in Yahoo Finance response');
-
-    const timestamps = result.timestamp || [];
-    const quote      = result.indicators?.quote?.[0] || {};
-    const regularMarketPrice = result.meta?.regularMarketPrice;
-
-    const candles = timestamps
-      .map((ts, i) => ({
-        ts:     ts * 1000,
-        open:   quote.open?.[i],
-        high:   quote.high?.[i],
-        low:    quote.low?.[i],
-        close:  quote.close?.[i],
-        volume: quote.volume?.[i] ?? 0,
-      }))
-      .filter(c => c.close != null && c.close > 0 && !isNaN(c.close))
-      .slice(-MAX_CANDLES);
-
-    if (candles.length === 0) throw new Error('No valid candles after parsing');
-
-    yfCache.data[asset] = { candles, fetchedAt: Date.now(), regularMarketPrice };
-    saveJSON(F.avCache, yfCache);
-    loadIntoPd(asset, candles);
-    _populateLivePrices(asset, yfCache.data[asset]);
-
-    const last = candles[candles.length - 1];
-    log(`[YF] ${asset}: ${candles.length} candles, last=$${(regularMarketPrice || last.close).toFixed(2)}`);
-    return true;
-  } catch(e) {
-    log(`[YF] ${asset} error: ${e.message}`);
-    const entry = yfCache.data[asset];
-    if (entry?.candles?.length) {
-      loadIntoPd(asset, entry.candles);
-      if (!state.livePrices[asset]?.price) _populateLivePrices(asset, entry);
-    }
-    return false;
-  }
-}
-
-// ─── REFRESH ORCHESTRATION ────────────────────────────────────────────────────
-
-async function startupFetch() {
-  log('[YF] Starting Yahoo Finance fetch for equities + commodities...');
-  for (const asset of [...CLASSES.equities, ...CLASSES.commodities]) {
-    await fetchYahooChart(asset);
-    await delay(300);
-  }
-  log('[YF] Startup fetch complete');
-}
-
-async function refreshEquitiesAndCommodities() {
-  for (const asset of [...CLASSES.equities, ...CLASSES.commodities]) {
-    await fetchYahooChart(asset);
-    await delay(300);
-  }
-}
-
-// Crypto refresh: CoinGecko live prices + OHLC history
-async function refreshCrypto() {
-  await fetchCoinGeckoLive();
-  for (const asset of CLASSES.crypto) {
-    await fetchCGOHLC(asset);
-    await delay(2000);
-  }
-}
-
 
 function getCurrentPrice(asset) {
   return state.livePrices[asset]?.price || pd[asset].closes[pd[asset].closes.length - 1] || 0;
@@ -643,42 +530,19 @@ function multiFactorSignals(cfg) {
 // STRATEGY 4 — BRIDGEWATER ALL-WEATHER
 // ──────────────────────────────────────────────────────────────────────────────
 function allWeatherTargets(cfg, regime) {
-  let buckets = {
-    crypto:      { target:0.25, assets: CLASSES.crypto },
-    equities:    { target:0.40, assets: CLASSES.equities },
-    commodities: { target:0.25, assets: CLASSES.commodities },
-    cash:        { target:0.10, assets: [] },
-  };
+  let cryptoTarget = 0.90;
+  let cashTarget   = 0.10;
 
-  // Risk-Off: shift 20% from equities to gold + cash
-  if (regime === 'RISK_OFF') {
-    buckets.equities.target   -= 0.20;
-    buckets.commodities.target += 0.10;
-    buckets.cash.target        += 0.10;
-  }
-  // Stagflation: favour commodities, reduce crypto
-  if (regime === 'STAGFLATION') {
-    buckets.commodities.target += 0.10;
-    buckets.crypto.target      -= 0.05;
-    buckets.equities.target    -= 0.05;
-  }
+  // Risk-Off: reduce exposure, hold more cash
+  if (regime === 'RISK_OFF')   { cryptoTarget -= 0.20; cashTarget += 0.20; }
+  // Stagflation: reduce crypto slightly
+  if (regime === 'STAGFLATION') { cryptoTarget -= 0.10; cashTarget += 0.10; }
 
   const targets = {};
-  for (const [bName, b] of Object.entries(buckets)) {
-    if (b.assets.length === 0) continue;
-
-    // Risk parity within bucket: allocate inversely proportional to 30d vol
-    const vols = b.assets.map(a => {
-      const v = rollingVolatility(pd[a].closes, 30);
-      return { asset:a, vol: v || 0.01 };
-    });
-    const totalInvVol = vols.reduce((s, v) => s + 1/v.vol, 0);
-
-    for (const { asset, vol } of vols) {
-      let weight = (1/vol / totalInvVol) * b.target;
-      weight = Math.min(weight, 0.15); // max 15% per asset
-      targets[asset] = weight;
-    }
+  const vols = CLASSES.crypto.map(a => ({ asset:a, vol: rollingVolatility(pd[a].closes, 30) || 0.01 }));
+  const totalInvVol = vols.reduce((s, v) => s + 1/v.vol, 0);
+  for (const { asset, vol } of vols) {
+    targets[asset] = Math.min((1/vol / totalInvVol) * cryptoTarget, 0.30);
   }
   return targets;
 }
@@ -687,43 +551,31 @@ function allWeatherTargets(cfg, regime) {
 // MACRO REGIME DETECTION
 // ──────────────────────────────────────────────────────────────────────────────
 function detectRegime() {
-  const spyCloses  = pd['SPY'].closes;
-  const goldCloses = pd['GC=F'].closes;
-  const oilCloses  = pd['CL=F'].closes;
+  const btcCloses = pd['BTC'].closes;
+  if (btcCloses.length < 50) return { regime: state.regime || 'RISK_ON', reason: 'Insufficient BTC data' };
 
-  if (spyCloses.length < 200) return { regime: state.regime, reason: 'Insufficient data' };
-
-  const spyNow   = spyCloses[spyCloses.length-1];
-  const spy200   = sma(spyCloses, 200);
-  const spyVol   = rollingVolatility(spyCloses, 20) || 0;
-
-  // Gold 30d momentum
-  const goldMom = goldCloses.length >= 720
-    ? (goldCloses[goldCloses.length-1] - goldCloses[goldCloses.length-720]) / goldCloses[goldCloses.length-720] * 100
-    : 0;
-  // Oil 30d momentum
-  const oilMom = oilCloses.length >= 720
-    ? (oilCloses[oilCloses.length-1] - oilCloses[oilCloses.length-720]) / oilCloses[oilCloses.length-720] * 100
-    : 0;
-  // SPY 30d return
-  const spyMom = spyCloses.length >= 720
-    ? (spyCloses[spyCloses.length-1] - spyCloses[spyCloses.length-720]) / spyCloses[spyCloses.length-720] * 100
+  const btcNow  = btcCloses[btcCloses.length - 1];
+  const sma50   = sma(btcCloses, 50);
+  const btcVol  = rollingVolatility(btcCloses, 20) || 0;
+  // Short-term momentum using available 1-min candles (up to 5h window)
+  const lookback = Math.min(btcCloses.length - 1, 240); // 240 min = 4h
+  const btcMom = lookback > 0
+    ? (btcNow - btcCloses[btcCloses.length - 1 - lookback]) / btcCloses[btcCloses.length - 1 - lookback] * 100
     : 0;
 
-  const aboveSMA200 = spy200 && spyNow > spy200;
-  const annualVol = spyVol;
+  const aboveSMA50 = sma50 && btcNow > sma50;
+  const annualVol  = btcVol;
 
   let regime, reason;
-
-  if (goldMom > 5 && oilMom > 5 && spyMom <= 2) {
-    regime = 'STAGFLATION';
-    reason = `Gold +${goldMom.toFixed(1)}%, Oil +${oilMom.toFixed(1)}% 30d, SPY flat`;
-  } else if (!aboveSMA200 || annualVol > 0.25) {
+  if (!aboveSMA50 || annualVol > 0.40) {
     regime = 'RISK_OFF';
-    reason = aboveSMA200 ? `SPY vol ${(annualVol*100).toFixed(1)}% > 25%` : 'SPY below 200 SMA';
+    reason = aboveSMA50 ? `BTC vol ${(annualVol*100).toFixed(1)}% > 40%` : 'BTC below 50-min SMA';
+  } else if (btcMom < -3) {
+    regime = 'STAGFLATION';
+    reason = `BTC 4h momentum ${btcMom.toFixed(1)}%`;
   } else {
     regime = 'RISK_ON';
-    reason = `SPY above 200 SMA, vol ${(annualVol*100).toFixed(1)}% < 25%`;
+    reason = `BTC above 50-min SMA, vol ${(annualVol*100).toFixed(1)}%`;
   }
 
   if (regime !== state.regime) {
@@ -740,7 +592,7 @@ async function updateSentiment(cfg) {
   if (!ai) return;
   log('[SENTIMENT] Updating for all assets...');
 
-  for (const asset of ALL_ASSETS) {
+  for (const asset of CLASSES.crypto) {
     const d = pd[asset];
     if (d.closes.length < 20) continue;
     const price    = getCurrentPrice(asset);
@@ -856,7 +708,7 @@ function layer2_checkStrategy(profile, strategy) {
 function layer3_checkAssetClass(profile, asset, notional) {
   const port = state.portfolios[profile];
   const cls  = ASSET_CLASS[asset];
-  const limits = { crypto: config.cryptoMax/100, equities: config.equitiesMax/100, commodities: config.commoditiesMax/100 };
+  const limits = { crypto: config.cryptoMax/100 };
   const limit = limits[cls] || 1;
 
   const classExposure = port.positions
@@ -1333,9 +1185,6 @@ async function start() {
   // Write default config if none exists
   if (!loadJSON(F.config)) saveJSON(F.config, DEFAULT_CONFIG);
 
-  // Load Yahoo Finance on-disk cache (survives restarts)
-  yfCache = loadJSON(F.avCache) || { data:{} };
-
   // Restore price history from previous run (survives Railway restarts)
   const savedPd = loadJSON(F.priceHistory);
   if (savedPd) {
@@ -1349,9 +1198,6 @@ async function start() {
   log('[APEX] Loading crypto OHLC from CoinGecko...');
   await fetchCoinGeckoLive();
   for (const asset of CLASSES.crypto) { await fetchCGOHLC(asset); await delay(2000); }
-
-  log('[APEX] Loading equities + commodities from Yahoo Finance...');
-  await startupFetch();
 
   // Initial regime detection
   const regimeResult = detectRegime();
@@ -1389,12 +1235,6 @@ async function start() {
       for (const asset of CLASSES.crypto) { await fetchCGOHLC(asset); await delay(2000); }
       await tick();
     } catch(e) { log(`[LOOP] CG OHLC tick error: ${e.message}`); }
-  }, 5 * 60_000);
-
-  // Equities/Commodities: Yahoo Finance refresh every 5 minutes
-  setInterval(async () => {
-    try { await refreshEquitiesAndCommodities(); await tick(); }
-    catch(e) { log(`[LOOP] YF refresh error: ${e.message}`); }
   }, 5 * 60_000);
 
   // Sentiment: every 4 hours
