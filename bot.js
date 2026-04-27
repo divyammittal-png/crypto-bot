@@ -27,7 +27,8 @@ const F = {
   config:   dataPath('config.json'),
   configLog:dataPath('config-log.json'),
   backtest: dataPath('backtest-results.json'),
-  avCache:  dataPath('av-cache.json'),
+  avCache:      dataPath('av-cache.json'),
+  priceHistory: dataPath('price-history.json'),
 };
 
 // ─── ASSET UNIVERSE ───────────────────────────────────────────────────────────
@@ -72,7 +73,7 @@ const DEFAULT_CONFIG = {
 };
 
 // ─── PRICE DATA STORE ─────────────────────────────────────────────────────────
-const MAX_CANDLES = 1500;
+const MAX_CANDLES = 300;
 const pd = {};
 for (const a of ALL_ASSETS) pd[a] = { closes:[], highs:[], lows:[], opens:[], volumes:[], timestamps:[] };
 
@@ -220,7 +221,7 @@ async function fetchCoinGeckoLive() {
   } catch(e) { log(`[CG] Live fetch error: ${e.message}`); }
 }
 
-// ─── COINGECKO: HISTORICAL OHLC (4h candles, 90 days) ────────────────────────
+// ─── COINGECKO: HISTORICAL PRICES (1-minute candles, last 24h) ───────────────
 async function fetchCGOHLC(asset) {
   const id = CG_IDS[asset];
   if (!id) return false;
@@ -228,15 +229,16 @@ async function fetchCGOHLC(asset) {
     const headers = {};
     if (process.env.COINGECKO_API_KEY) headers['x-cg-demo-api-key'] = process.env.COINGECKO_API_KEY;
     const data = await httpsGetJSON(
-      `https://api.coingecko.com/api/v3/coins/${id}/ohlc?vs_currency=usd&days=90`,
+      `https://api.coingecko.com/api/v3/coins/${id}/market_chart?vs_currency=usd&days=1&interval=minutely`,
       { headers }
     );
-    if (!Array.isArray(data) || data.length === 0) throw new Error('Empty OHLC response');
-    const candles = data
-      .map(([ts, o, h, l, c]) => ({ ts, open:o, high:h, low:l, close:c, volume:0 }))
+    if (!Array.isArray(data?.prices) || data.prices.length === 0) throw new Error('Empty market_chart response');
+    const volMap = new Map((data.total_volumes || []).map(([ts, v]) => [ts, v]));
+    const candles = data.prices
+      .map(([ts, price]) => ({ ts, open:price, high:price, low:price, close:price, volume: volMap.get(ts) ?? 0 }))
       .slice(-MAX_CANDLES);
     loadIntoPd(asset, candles);
-    log(`[CG] ${asset} OHLC: ${candles.length} 4h-candles loaded`);
+    log(`[CG] ${asset} 1m: ${candles.length} candles loaded`);
     return true;
   } catch(e) {
     log(`[CG] ${asset} OHLC error: ${e.message}`);
@@ -1303,6 +1305,7 @@ async function tick() {
   state.lastUpdate = now();
   saveJSON(F.state, state);
   saveJSON(F.trades, allTrades.slice(-1000));
+  saveJSON(F.priceHistory, pd);
 
   // Log summary
   const total = Object.values(state.portfolios).reduce((s, p) => s + p.nav, 0);
@@ -1332,6 +1335,15 @@ async function start() {
 
   // Load Yahoo Finance on-disk cache (survives restarts)
   yfCache = loadJSON(F.avCache) || { data:{} };
+
+  // Restore price history from previous run (survives Railway restarts)
+  const savedPd = loadJSON(F.priceHistory);
+  if (savedPd) {
+    for (const asset of ALL_ASSETS) {
+      if (savedPd[asset]?.closes?.length) pd[asset] = savedPd[asset];
+    }
+    log('[APEX] Price history restored from disk');
+  }
 
   // Initial data load
   log('[APEX] Loading crypto OHLC from CoinGecko...');

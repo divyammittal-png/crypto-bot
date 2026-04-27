@@ -13,3 +13,4 @@ analyst-reports.json
 backtest-results.json
 sentiment.json
 av-cache.json
+price-history.json
