@@ -24,7 +24,7 @@ const F = {
   backtest:      dataPath('backtest-results.json'),
 };
 
-const ALL_ASSETS = ['BTC','ETH','SOL','BNB','XRP','AAPL','TSLA','NVDA','SPY','AMZN','MSFT','GOOGL','META','NFLX','JPM','QQQ','GC=F','SI=F','CL=F','NG=F'];
+const ALL_ASSETS = ['BTC','ETH','SOL','BNB','XRP'];
 
 const DEFAULT_CONFIG = {
   strategyWeights: { ptj:1, statArb:1, multiFactor:1, allWeather:1 },
@@ -814,8 +814,11 @@ function updatePositions(state) {
   if (!allPositions.length) { tbody.innerHTML='<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">No open positions</td></tr>'; return; }
   const prices = state.livePrices||{};
   tbody.innerHTML = allPositions.map(pos => {
-    const cur = prices[pos.asset]?.price || pos.entryPrice;
-    const upnl = pos.side==='LONG' ? (cur-pos.entryPrice)*pos.qty : (pos.entryPrice-cur)*pos.qty;
+    const currentPrice = prices[pos.asset]?.price || pos.entryPrice;
+    const qty = pos.qty || (pos.notional && pos.entryPrice ? pos.notional / pos.entryPrice : 0);
+    const upnl = pos.side==='LONG'
+      ? (currentPrice - pos.entryPrice) * qty
+      : (pos.entryPrice - currentPrice) * qty;
     const openedMs = new Date(pos.openedAt).getTime();
     const dur = Math.floor((Date.now()-openedMs)/60000);
     const durStr = dur > 60 ? Math.floor(dur/60)+'h '+dur%60+'m' : dur+'m';
@@ -825,7 +828,7 @@ function updatePositions(state) {
       <td>\${pos.profile||pos.profileLabel}</td>
       <td><span class="badge badge-\${pos.side.toLowerCase()}">\${pos.side}</span></td>
       <td>£\${fmtPrice(pos.entryPrice)}</td>
-      <td>£\${fmtPrice(cur)}</td>
+      <td>£\${fmtPrice(currentPrice)}</td>
       <td class="\${upnl>=0?'up':'dn'}">\${upnl>=0?'+':'−'}£\${Math.abs(upnl).toFixed(2)} <span class="pnl-label \${upnl>=0?'pnl-label-profit':'pnl-label-loss'}">\${upnl>=0?'▲ PROFIT':'▼ LOSS'}</span></td>
       <td>£\${fmtPrice(pos.stopLoss)}</td>
       <td>£\${fmtPrice(pos.takeProfit)}</td>
