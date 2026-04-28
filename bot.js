@@ -1198,7 +1198,7 @@ async function start() {
   // Initial data load
   log('[APEX] Loading crypto OHLC from CoinGecko...');
   await fetchCoinGeckoLive();
-  for (const asset of CLASSES.crypto) { await fetchCGOHLC(asset); await delay(2000); }
+  for (const asset of CLASSES.crypto) { await fetchCGOHLC(asset); await delay(8000); }
 
   // Initial regime detection
   const regimeResult = detectRegime();
@@ -1233,10 +1233,10 @@ async function start() {
 
   setInterval(async () => {
     try {
-      for (const asset of CLASSES.crypto) { await fetchCGOHLC(asset); await delay(2000); }
+      for (const asset of CLASSES.crypto) { await fetchCGOHLC(asset); await delay(8000); }
       await tick();
     } catch(e) { log(`[LOOP] CG OHLC tick error: ${e.message}`); }
-  }, 5 * 60_000);
+  }, 6 * 60_000);
 
   // Sentiment: every 4 hours
   setInterval(async () => {
