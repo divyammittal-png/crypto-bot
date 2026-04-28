@@ -213,7 +213,7 @@ async function fetchCGOHLC(asset) {
     const headers = {};
     if (process.env.COINGECKO_API_KEY) headers['x-cg-demo-api-key'] = process.env.COINGECKO_API_KEY;
     const data = await httpsGetJSON(
-      `https://api.coingecko.com/api/v3/coins/${id}/market_chart?vs_currency=usd&days=1&interval=minutely`,
+      `https://api.coingecko.com/api/v3/coins/${id}/market_chart?vs_currency=usd&days=1`,
       { headers }
     );
     if (!Array.isArray(data?.prices) || data.prices.length === 0) throw new Error('Empty market_chart response');
