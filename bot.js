@@ -1,4 +1,5 @@
 'use strict';
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 // ══════════════════════════════════════════════════════════════════════════════
 // APEX BOT — Hedge Fund Grade Autonomous Trading System
 // ══════════════════════════════════════════════════════════════════════════════
@@ -417,7 +418,7 @@ function ptjSignal(asset, cfg) {
   const ema20   = ema(d.closes, 20);
   const ema50   = ema(d.closes, 50);
   const rsiVal  = rsi(d.closes, cfg.rsiPeriod);
-  const prevRsi = d.closes.length > cfg.rsiPeriod+2 ? rsi(d.closes.slice(0,-1), cfg.rsiPeriod) : rsiVal;
+
   const price   = getCurrentPrice(asset);
 
   if (!sma200 || !ema20 || !ema50 || rsiVal == null) return 'HOLD';
@@ -428,9 +429,9 @@ function ptjSignal(asset, cfg) {
   const bearMomentum = ema20 < ema50;
 
   // RSI crossing above 40 in uptrend
-  const rsiBuyEntry  = prevRsi < cfg.rsiOversold  && rsiVal >= cfg.rsiOversold  && uptrend  && bullMomentum;
+  const rsiBuyEntry  = rsiVal < cfg.rsiOversold  && uptrend  && bullMomentum;
   // RSI crossing below 60 in downtrend
-  const rsiShortEntry = prevRsi > cfg.rsiOverbought && rsiVal <= cfg.rsiOverbought && downtrend && bearMomentum;
+  const rsiShortEntry = rsiVal > cfg.rsiOverbought && downtrend;
 
   const { boost } = bbSignal(asset, cfg);
 
@@ -460,8 +461,8 @@ function statArbSignals(cfg) {
     const z = zscore(spread, 20);
     if (z == null) continue;
 
-    if (z > 2.0)  signals.push({ assetA, assetB, side:'A_SHORT_B_LONG',  zscore:z });
-    if (z < -2.0) signals.push({ assetA, assetB, side:'A_LONG_B_SHORT',  zscore:z });
+    if (z > 0.8)  signals.push({ assetA, assetB, side:'A_SHORT_B_LONG',  zscore:z });
+    if (z < -0.8) signals.push({ assetA, assetB, side:'A_LONG_B_SHORT',  zscore:z });
     if (Math.abs(z) < 0.3) signals.push({ assetA, assetB, side:'EXIT', zscore:z });
   }
   return signals;
