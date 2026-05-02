@@ -123,6 +123,32 @@ app.post('/api/killswitch/reset', (req, res) => {
   res.json({ ok:true });
 });
 
+// ─── SCORECARD API ───────────────────────────────────────────────────────────
+app.get('/api/scorecard', (req, res) => {
+  const trades  = loadJSON(F.trades) || [];
+  const weights = loadJSON(F.weights) || {};
+  const strats  = ['ptj','statArb','multiFactor','allWeather'];
+  const profiles = ['aggressive','balanced','conservative'];
+  const out = {};
+  for (const strat of strats) {
+    out[strat] = {};
+    for (const prof of profiles) {
+      const t = trades.filter(x => x.strategy === strat && x.profile === prof);
+      const wins = t.filter(x => x.win);
+      const wr   = t.length ? wins.length / t.length : 0;
+      const pnl  = t.reduce((s, x) => s + (x.pnl || 0), 0);
+      const returns = t.map(x => x.pnlPct);
+      const mn  = returns.length ? returns.reduce((a, b) => a + b, 0) / returns.length : 0;
+      const sd  = returns.length > 1 ? Math.sqrt(returns.reduce((a, b) => a + (b - mn) ** 2, 0) / returns.length) : 0;
+      const sharpe = sd > 0 ? (mn / sd) * Math.sqrt(252) : 0;
+      let peak = 0, maxDD = 0, run = 0;
+      for (const x of t) { run += x.pnl || 0; if (run > peak) peak = run; maxDD = Math.max(maxDD, peak - run); }
+      out[strat][prof] = { wr, sharpe, maxDD, trades: t.length, pnl, wt: weights[`${strat}_${prof}`] || 0.25 };
+    }
+  }
+  res.json(out);
+});
+
 // ─── DASHBOARD ────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.send(DASHBOARD_HTML));
 
@@ -617,10 +643,11 @@ function initChart() {
 // ─── DATA REFRESH ────────────────────────────────────────────────────────────
 async function refresh() {
   try {
-    const [dataResp, sentResp, btResp] = await Promise.all([
+    const [dataResp, sentResp, btResp, scorecardResp] = await Promise.all([
       fetch('/api/data').then(r=>r.json()),
       fetch('/api/sentiment').then(r=>r.json()),
       fetch('/api/backtest').then(r=>r.json()),
+      fetch('/api/scorecard').then(r=>r.json()),
     ]);
 
     const { state, trades, weights } = dataResp;
@@ -630,7 +657,7 @@ async function refresh() {
     updateStatCards(state, trades);
     updateEquityCurve(state);
     updateHeatmap(state, trades);
-    updateScorecard(trades, weights);
+    updateScorecard(scorecardResp);
     updatePositions(state);
     updateTrades(trades);
     updateMacro(state, sentResp, btResp);
@@ -778,28 +805,21 @@ function updateHeatmap(state, trades) {
   }).join('');
 }
 
-function updateScorecard(trades, weights) {
+function updateScorecard(scorecard) {
   const strats = ['ptj','statArb','multiFactor','allWeather'];
   const profiles = ['aggressive','balanced','conservative'];
   const tbody = document.getElementById('scorecard-body');
 
   tbody.innerHTML = strats.map(strat => {
     const cols = profiles.map(prof => {
-      const t = (trades||[]).filter(x=>x.strategy===strat&&x.profile===prof);
-      const wins = t.filter(x=>x.win); const wr = t.length ? wins.length/t.length : 0;
-      const pnl = t.reduce((s,x)=>s+x.pnl,0);
-      const returns = t.map(x=>x.pnlPct); const mn = returns.length ? returns.reduce((a,b)=>a+b)/returns.length : 0;
-      const sd = returns.length>1 ? Math.sqrt(returns.reduce((a,b)=>a+(b-mn)**2)/returns.length) : 0;
-      const sharpe = sd>0 ? mn/sd*Math.sqrt(252) : 0;
-      const wt = weights[\`\${strat}_\${prof}\`] || 0.25;
-      let peak=0,maxDD=0,run=0; for(const x of t){run+=x.pnl;if(run>peak)peak=run;maxDD=Math.max(maxDD,peak-run);}
-      const sharpeClass = sharpe>1?'sharpe-green':sharpe>0?'sharpe-yellow':'sharpe-red';
-      return \`<td style="border-left:2px solid var(--border)">\${(wr*100).toFixed(0)}%</td>
-        <td class="\${sharpeClass}">\${sharpe.toFixed(2)}</td>
-        <td>\${maxDD>0?'-£'+maxDD.toFixed(2):'—'}</td>
-        <td>\${t.length}</td>
-        <td class="\${pnl>=0?'up':'dn'}">\${pnl>=0?'+':'−'}£\${Math.abs(pnl).toFixed(2)} <span class="pnl-label \${pnl>=0?'pnl-label-profit':'pnl-label-loss'}">\${pnl>=0?'▲':'▼'}</span></td>
-        <td>\${(wt*100).toFixed(0)}%</td>\`;
+      const m = (scorecard && scorecard[strat] && scorecard[strat][prof]) || { wr:0, sharpe:0, maxDD:0, trades:0, pnl:0, wt:0.25 };
+      const sharpeClass = m.sharpe>1?'sharpe-green':m.sharpe>0?'sharpe-yellow':'sharpe-red';
+      return \`<td style="border-left:2px solid var(--border)">\${(m.wr*100).toFixed(0)}%</td>
+        <td class="\${sharpeClass}">\${m.sharpe.toFixed(2)}</td>
+        <td>\${m.maxDD>0?'-£'+m.maxDD.toFixed(2):'—'}</td>
+        <td>\${m.trades}</td>
+        <td class="\${m.pnl>=0?'up':'dn'}">\${m.pnl>=0?'+':'−'}£\${Math.abs(m.pnl).toFixed(2)} <span class="pnl-label \${m.pnl>=0?'pnl-label-profit':'pnl-label-loss'}">\${m.pnl>=0?'▲':'▼'}</span></td>
+        <td>\${(m.wt*100).toFixed(0)}%</td>\`;
     }).join('');
     return \`<tr><td><strong>\${stratLabel(strat)}</strong></td>\${cols}</tr>\`;
   }).join('');
