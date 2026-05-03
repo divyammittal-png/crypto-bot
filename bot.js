@@ -8,10 +8,6 @@ const http  = require('http');
 const fs    = require('fs');
 const path  = require('path');
 
-let Anthropic;
-try { Anthropic = require('@anthropic-ai/sdk'); } catch { /* optional */ }
-const ai = (Anthropic && process.env.ANTHROPIC_API_KEY)
-  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
 
 // ─── PERSISTENT STORAGE ───────────────────────────────────────────────────────
 const { dataPath, migrate } = require('./storage');
@@ -22,7 +18,6 @@ const F = {
   state:    dataPath('state.json'),
   trades:   dataPath('trades.json'),
   learning: dataPath('learning.json'),
-  sentiment:dataPath('sentiment.json'),
   weights:  dataPath('strategy-weights.json'),
   reports:  dataPath('reports.json'),
   config:   dataPath('config.json'),
@@ -74,12 +69,10 @@ for (const a of ALL_ASSETS) pd[a] = { closes:[], highs:[], lows:[], opens:[], vo
 let state       = null;
 let allTrades   = [];
 let learningData= [];
-let sentimentData = {};
 let strategyWeights = {};
 let reports     = [];
 let config      = { ...DEFAULT_CONFIG };
 
-let lastSentimentUpdate  = 0;
 let lastRegimeUpdate     = 0;
 let lastLearningCycle    = 0;
 let lastMultiFactorReb   = 0;
@@ -586,59 +579,6 @@ function detectRegime() {
   return { regime, reason };
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// SENTIMENT ANALYSIS via Claude API
-// ──────────────────────────────────────────────────────────────────────────────
-async function updateSentiment(cfg) {
-  if (!ai) return;
-  log('[SENTIMENT] Updating for all assets...');
-
-  for (const asset of CLASSES.crypto) {
-    const d = pd[asset];
-    if (d.closes.length < 20) continue;
-    const price    = getCurrentPrice(asset);
-    const rsiVal   = rsi(d.closes, cfg.rsiPeriod) || 50;
-    const ema20Val = ema(d.closes, 20);
-    const ema50Val = ema(d.closes, 50);
-
-    try {
-      const resp = await ai.messages.create({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 200,
-        system: [
-          {
-            type: 'text',
-            text: 'You are a financial sentiment analyst. Respond only with valid JSON.',
-            cache_control: { type: 'ephemeral' },
-          }
-        ],
-        messages: [{
-          role: 'user',
-          content: `Rate the current market sentiment for ${asset} on a scale from -1.0 (extremely bearish) to +1.0 (extremely bullish) based on: current price $${price.toFixed(2)}, RSI=${rsiVal.toFixed(1)}, price vs EMA20=${ema20Val ? (price>ema20Val?'above':'below') : 'N/A'}, price vs EMA50=${ema50Val ? (price>ema50Val?'above':'below') : 'N/A'}. Return ONLY a JSON object: {"score": number, "reasoning": string, "confidence": string}`,
-        }],
-      });
-
-      const text = resp.content[0].text.trim();
-      const match = text.match(/\{[\s\S]*\}/);
-      if (match) {
-        const parsed = JSON.parse(match[0]);
-        sentimentData[asset] = { ...parsed, updatedAt: now() };
-      }
-    } catch(e) { log(`[SENTIMENT] ${asset} error: ${e.message}`); }
-
-    await delay(500);
-  }
-  saveJSON(F.sentiment, sentimentData);
-  log('[SENTIMENT] Update complete');
-}
-
-function sentimentBoost(asset) {
-  const s = sentimentData[asset];
-  if (!s || s.score == null) return 0;
-  if (s.score > 0.5)  return 0.20;
-  if (s.score < -0.5) return -0.20;
-  return 0;
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // POSITION SIZING — KELLY CRITERION
@@ -1005,7 +945,7 @@ function runPTJ(cfg) {
     for (const asset of ALL_ASSETS) {
       if (!config.enabledAssets?.[asset]) continue;
       const signal = ptjSignal(asset, cfg);
-      const boost  = bbSignal(asset, cfg).boost + sentimentBoost(asset);
+      const boost  = bbSignal(asset, cfg).boost;
 
       if (signal === 'BUY' || (signal === 'HOLD' && boost > 0.3)) {
         // Check if already long
@@ -1178,7 +1118,6 @@ async function start() {
   state           = loadJSON(F.state) || initState();
   allTrades       = loadJSON(F.trades) || [];
   learningData    = loadJSON(F.learning) || [];
-  sentimentData   = loadJSON(F.sentiment) || {};
   strategyWeights = loadJSON(F.weights) || initWeights();
   reports         = loadJSON(F.reports) || [];
   config          = { ...DEFAULT_CONFIG, ...(loadJSON(F.config) || {}) };
@@ -1206,12 +1145,6 @@ async function start() {
   state.regimeReason = regimeResult.reason;
   lastRegimeUpdate = Date.now();
 
-  // Initial sentiment (if API key available)
-  if (ai) {
-    await updateSentiment(config);
-    lastSentimentUpdate = Date.now();
-  }
-
   // Run backtest on startup
   try {
     const { runBacktest } = require('./backtest');
@@ -1238,12 +1171,6 @@ async function start() {
     } catch(e) { log(`[LOOP] CG OHLC tick error: ${e.message}`); }
   }, 6 * 60_000);
 
-  // Sentiment: every 4 hours
-  setInterval(async () => {
-    if (!ai) return;
-    try { await updateSentiment(config); } catch(e) { log(`[SENT] Error: ${e.message}`); }
-  }, 4 * 3600_000);
-
   // Regime: every 4 hours
   setInterval(() => {
     try {
@@ -1265,39 +1192,6 @@ async function start() {
       await runBacktest();
     } catch(e) { log(`[BACKTEST] Weekly error: ${e.message}`); }
   }, 7 * 24 * 3600_000);
-
-  // Daily analyst report at 08:00 UTC
-  (function scheduleAnalyst() {
-    let analyst;
-    try { analyst = require('./analyst'); } catch(e) { log(`[ANALYST] Module load failed: ${e.message}`); return; }
-
-    const runReport = async () => {
-      try { await analyst.generateDailyReport(); }
-      catch(e) { log(`[ANALYST] Report error: ${e.message}`); }
-    };
-
-    // Run on startup if no report for today
-    if (!analyst.todayHasReport()) {
-      log('[ANALYST] No report for today — generating startup report');
-      runReport();
-    }
-
-    // Schedule precise 08:00 UTC daily trigger
-    function msUntil8amUTC() {
-      const now  = new Date();
-      const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 8, 0, 0, 0));
-      if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
-      return next - now;
-    }
-
-    function scheduleNext() {
-      const delay = msUntil8amUTC();
-      log(`[ANALYST] Next report scheduled in ${Math.round(delay/3600000*10)/10}h (08:00 UTC)`);
-      setTimeout(() => { runReport(); setInterval(runReport, 24 * 3600_000); }, delay);
-    }
-
-    scheduleNext();
-  })();
 
   log('[APEX] All schedulers running. Bot is live.');
 }

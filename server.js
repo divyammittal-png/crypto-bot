@@ -18,7 +18,6 @@ const F = {
   sentiment:     dataPath('sentiment.json'),
   weights:       dataPath('strategy-weights.json'),
   reports:       dataPath('reports.json'),
-  analystReports:dataPath('analyst-reports.json'),
   config:        dataPath('config.json'),
   configLog:     dataPath('config-log.json'),
   backtest:      dataPath('backtest-results.json'),
@@ -35,6 +34,11 @@ const DEFAULT_CONFIG = {
   killSwitchThreshold:-20, maxPortfolioHeat:60, cashBuffer:20,
   cryptoMax:40, equitiesMax:50, commoditiesMax:30,
   enabledAssets: Object.fromEntries(ALL_ASSETS.map(a=>[a,true])),
+  capitalAllocation: {
+    aggressive:   { ptj:25, statArb:25, multiFactor:25, allWeather:25 },
+    balanced:     { ptj:25, statArb:25, multiFactor:25, allWeather:25 },
+    conservative: { ptj:25, statArb:25, multiFactor:25, allWeather:25 },
+  },
 };
 
 const PRESETS = {
@@ -96,26 +100,6 @@ app.post('/api/preset', (req, res) => {
   res.json({ ok:true, config:updated });
 });
 
-app.get('/api/analyst-report', (req, res) => {
-  const reports = loadJSON(F.analystReports) || [];
-  res.json(reports[0] || null);
-});
-
-let reportGenerating = false;
-app.post('/api/generate-report', async (req, res) => {
-  if (reportGenerating) return res.status(409).json({ error: 'Report generation already in progress' });
-  reportGenerating = true;
-  res.json({ ok: true, message: 'Report generation started' });
-  try {
-    const { generateDailyReport } = require('./analyst');
-    await generateDailyReport();
-  } catch(e) {
-    console.error('[SERVER] generate-report error:', e.message);
-  } finally {
-    reportGenerating = false;
-  }
-});
-
 app.post('/api/killswitch/reset', (req, res) => {
   const state = loadJSON(F.state) || {};
   if (state.killSwitch) { state.killSwitch.triggered = false; state.killSwitch.reason = null; }
@@ -143,10 +127,52 @@ app.get('/api/scorecard', (req, res) => {
       const sharpe = sd > 0 ? (mn / sd) * Math.sqrt(252) : 0;
       let peak = 0, maxDD = 0, run = 0;
       for (const x of t) { run += x.pnl || 0; if (run > peak) peak = run; maxDD = Math.max(maxDD, peak - run); }
-      out[strat][prof] = { wr, sharpe, maxDD, trades: t.length, pnl, wt: weights[`${strat}_${prof}`] || 0.25 };
+      const losses = t.filter(x => !x.win);
+      const avgWin  = wins.length  ? wins.reduce((s, x) => s + (x.pnl || 0), 0) / wins.length   : 0;
+      const avgLoss = losses.length ? losses.reduce((s, x) => s + (x.pnl || 0), 0) / losses.length : 0;
+      out[strat][prof] = { wr, sharpe, maxDD, trades: t.length, pnl, wt: weights[`${strat}_${prof}`] || 0.25, avgWin, avgLoss };
     }
   }
   res.json(out);
+});
+
+// ─── P&L SUMMARY API ─────────────────────────────────────────────────────────
+app.get('/api/pnl-summary', (req, res) => {
+  const trades = loadJSON(F.trades) || [];
+  const state  = loadJSON(F.state)  || {};
+  const ports  = state.portfolios   || {};
+  const prices = state.livePrices   || {};
+
+  const now       = new Date();
+  const todayStr  = now.toISOString().slice(0, 10);
+  const weekStart = new Date(now); weekStart.setDate(now.getDate() - now.getDay());
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+  function periodStats(filterFn) {
+    const t = filterFn ? trades.filter(filterFn) : trades;
+    const pnl  = t.reduce((s, x) => s + (x.pnl || 0), 0);
+    const wins = t.filter(x => x.win).length;
+    return { pnl, trades: t.length, wr: t.length ? wins / t.length : 0 };
+  }
+
+  let unrealised = 0;
+  for (const port of Object.values(ports)) {
+    for (const pos of (port.positions || [])) {
+      const cur = prices[pos.asset]?.price || pos.entryPrice;
+      unrealised += pos.side === 'LONG'
+        ? (cur - pos.entryPrice) * pos.qty
+        : (pos.entryPrice - cur) * pos.qty;
+    }
+  }
+
+  res.json({
+    today:   periodStats(t => (t.closedAt || t.openedAt || '').slice(0, 10) === todayStr),
+    week:    periodStats(t => new Date(t.closedAt || t.openedAt) >= weekStart),
+    month:   periodStats(t => new Date(t.closedAt || t.openedAt) >= monthStart),
+    allTime: periodStats(null),
+    unrealised,
+    openPositions: Object.values(ports).reduce((s, p) => s + (p.positions || []).length, 0),
+  });
 });
 
 // ─── DASHBOARD ────────────────────────────────────────────────────────────────
@@ -159,7 +185,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>APEX BOT — Hedge Fund Grade Trading System</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 :root {
   --bg:#ffffff; --bg2:#f8f9fa; --bg3:#f0f2f5;
@@ -192,8 +217,8 @@ h3{font-size:13px;font-weight:600;color:var(--muted);margin-bottom:8px}
 .section{background:#fff;border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px;box-shadow:var(--shadow)}
 
 /* STAT CARDS */
-.stats-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:12px;margin-bottom:16px}
-@media(max-width:1400px){.stats-grid{grid-template-columns:repeat(4,1fr)}}
+.stats-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:16px}
+@media(max-width:1400px){.stats-grid{grid-template-columns:repeat(3,1fr)}}
 @media(max-width:768px){.stats-grid{grid-template-columns:repeat(2,1fr)}}
 .stat-card{background:#fff;border:1px solid var(--border);border-radius:10px;padding:14px;box-shadow:var(--shadow);position:relative;overflow:hidden}
 .stat-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;border-radius:3px 0 0 3px}
@@ -208,10 +233,9 @@ h3{font-size:13px;font-weight:600;color:var(--muted);margin-bottom:8px}
 .stat-sub{font-size:11px;color:var(--muted);margin-top:3px}
 .up{color:var(--green)} .dn{color:var(--red)}
 
-/* CHART */
-.chart-wrap{position:relative;height:250px}
-.chart-row{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:16px}
-@media(max-width:900px){.chart-row{grid-template-columns:1fr}}
+/* P&L SUMMARY */
+.pnl-table td,.pnl-table th{text-align:center}
+.pnl-table td:first-child,.pnl-table th:first-child{text-align:left}
 
 /* HEATMAP */
 .heatmap-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:6px}
@@ -303,17 +327,6 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
 .scorecard table th,.scorecard table td{text-align:center}
 .scorecard table th:first-child,.scorecard table td:first-child{text-align:left}
 
-/* ANALYST REPORT */
-.report-meta{font-size:11px;color:var(--muted);margin-bottom:16px;display:flex;gap:16px;flex-wrap:wrap}
-.report-meta span{display:flex;align-items:center;gap:4px}
-.report-body h2{font-size:14px;font-weight:700;color:var(--text);margin:16px 0 6px;padding-bottom:4px;border-bottom:1px solid var(--border);text-transform:none;letter-spacing:0}
-.report-body ul{margin:4px 0 10px 18px;padding:0}
-.report-body li{margin:2px 0;color:var(--text)}
-.report-body p{margin:0 0 8px;color:var(--text);line-height:1.7}
-.report-body strong{font-weight:700}
-.config-applied{background:#fffff0;border:1px solid #fef08a;border-radius:8px;padding:12px 16px;margin-top:16px}
-.config-applied-title{font-size:11px;font-weight:700;color:#d69e2e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
-.config-applied pre{font-size:12px;color:var(--text);margin:0;white-space:pre-wrap}
 </style>
 </head>
 <body>
@@ -360,11 +373,6 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
     <div class="stat-value" id="s-open">0</div>
     <div class="stat-sub" id="s-open-sub">across all profiles</div>
   </div>
-  <div class="stat-card purple">
-    <div class="stat-label">Portfolio Heat</div>
-    <div class="stat-value" id="s-heat">0%</div>
-    <div class="stat-sub" id="s-heat-sub">max 60%</div>
-  </div>
   <div class="stat-card teal">
     <div class="stat-label">Best Strategy</div>
     <div class="stat-value" id="s-best" style="font-size:14px">—</div>
@@ -372,42 +380,50 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
   </div>
 </div>
 
-<!-- CHARTS ROW -->
-<div class="chart-row">
-  <div class="section">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-      <h2>Equity Curve</h2>
-      <div style="display:flex;gap:8px;font-size:11px">
-        <label style="cursor:pointer;display:flex;align-items:center;gap:4px"><input type="checkbox" id="toggle-ptj" checked> Aggressive</label>
-        <label style="cursor:pointer;display:flex;align-items:center;gap:4px"><input type="checkbox" id="toggle-stat" checked> Balanced</label>
-        <label style="cursor:pointer;display:flex;align-items:center;gap:4px"><input type="checkbox" id="toggle-mf" checked> Conservative</label>
-      </div>
-    </div>
-    <div class="chart-wrap"><canvas id="equity-chart"></canvas></div>
+<!-- P&L SUMMARY -->
+<div class="section">
+  <h2>P&amp;L Summary</h2>
+  <div class="table-wrap">
+    <table class="pnl-table">
+      <thead>
+        <tr>
+          <th></th>
+          <th>Today</th>
+          <th>This Week</th>
+          <th>This Month</th>
+          <th>Life-to-Date</th>
+        </tr>
+      </thead>
+      <tbody id="pnl-summary-body">
+        <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:12px">Loading...</td></tr>
+      </tbody>
+    </table>
   </div>
-  <div class="section">
-    <h2>VaR &amp; Risk Gauges</h2>
-    <div class="risk-grid">
-      <div class="risk-card">
-        <div class="risk-label">Portfolio Heat</div>
-        <div class="risk-val" id="g-heat">—</div>
-        <div class="gauge-bar"><div class="gauge-fill" id="g-heat-bar" style="background:var(--yellow);width:0%"></div></div>
-      </div>
-      <div class="risk-card">
-        <div class="risk-label">Drawdown</div>
-        <div class="risk-val" id="g-dd">—</div>
-        <div class="gauge-bar"><div class="gauge-fill" id="g-dd-bar" style="background:var(--red);width:0%"></div></div>
-      </div>
-      <div class="risk-card">
-        <div class="risk-label">Daily VaR 95%</div>
-        <div class="risk-val" id="g-var">—</div>
-        <div class="gauge-bar"><div class="gauge-fill" id="g-var-bar" style="background:var(--blue);width:0%"></div></div>
-      </div>
-      <div class="risk-card" title="Multiple positions moving together — new position sizes auto-reduced 50%">
-        <div class="risk-label">Corr. Risk</div>
-        <div class="risk-val" id="g-corr">—</div>
-        <div class="gauge-bar"><div class="gauge-fill" id="g-corr-bar" style="background:var(--purple,#805ad5);width:0%"></div></div>
-      </div>
+</div>
+
+<!-- VAR & RISK GAUGES -->
+<div class="section">
+  <h2>VaR &amp; Risk Gauges</h2>
+  <div class="risk-grid">
+    <div class="risk-card">
+      <div class="risk-label">Portfolio Heat</div>
+      <div class="risk-val" id="g-heat">—</div>
+      <div class="gauge-bar"><div class="gauge-fill" id="g-heat-bar" style="background:var(--yellow);width:0%"></div></div>
+    </div>
+    <div class="risk-card">
+      <div class="risk-label">Drawdown</div>
+      <div class="risk-val" id="g-dd">—</div>
+      <div class="gauge-bar"><div class="gauge-fill" id="g-dd-bar" style="background:var(--red);width:0%"></div></div>
+    </div>
+    <div class="risk-card">
+      <div class="risk-label">Daily VaR 95%</div>
+      <div class="risk-val" id="g-var">—</div>
+      <div class="gauge-bar"><div class="gauge-fill" id="g-var-bar" style="background:var(--blue);width:0%"></div></div>
+    </div>
+    <div class="risk-card" title="Multiple positions moving together — new position sizes auto-reduced 50%">
+      <div class="risk-label">Corr. Risk</div>
+      <div class="risk-val" id="g-corr">—</div>
+      <div class="gauge-bar"><div class="gauge-fill" id="g-corr-bar" style="background:var(--purple,#805ad5);width:0%"></div></div>
     </div>
   </div>
 </div>
@@ -437,14 +453,14 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
         <thead>
           <tr>
             <th rowspan="2">Strategy</th>
-            <th colspan="6" style="text-align:center;border-left:2px solid var(--border)">AGGRESSIVE</th>
-            <th colspan="6" style="text-align:center;border-left:2px solid var(--border)">BALANCED</th>
-            <th colspan="6" style="text-align:center;border-left:2px solid var(--border)">CONSERVATIVE</th>
+            <th colspan="8" style="text-align:center;border-left:2px solid var(--border)">AGGRESSIVE</th>
+            <th colspan="8" style="text-align:center;border-left:2px solid var(--border)">BALANCED</th>
+            <th colspan="8" style="text-align:center;border-left:2px solid var(--border)">CONSERVATIVE</th>
           </tr>
           <tr>
-            <th style="border-left:2px solid var(--border)">WR%</th><th>Sharpe</th><th>MaxDD</th><th>Trades</th><th>P&amp;L</th><th>Wt</th>
-            <th style="border-left:2px solid var(--border)">WR%</th><th>Sharpe</th><th>MaxDD</th><th>Trades</th><th>P&amp;L</th><th>Wt</th>
-            <th style="border-left:2px solid var(--border)">WR%</th><th>Sharpe</th><th>MaxDD</th><th>Trades</th><th>P&amp;L</th><th>Wt</th>
+            <th style="border-left:2px solid var(--border)">WR%</th><th>Sharpe</th><th>MaxDD</th><th>Trades</th><th>P&amp;L</th><th>Avg W</th><th>Avg L</th><th>Wt</th>
+            <th style="border-left:2px solid var(--border)">WR%</th><th>Sharpe</th><th>MaxDD</th><th>Trades</th><th>P&amp;L</th><th>Avg W</th><th>Avg L</th><th>Wt</th>
+            <th style="border-left:2px solid var(--border)">WR%</th><th>Sharpe</th><th>MaxDD</th><th>Trades</th><th>P&amp;L</th><th>Avg W</th><th>Avg L</th><th>Wt</th>
           </tr>
         </thead>
         <tbody id="scorecard-body"></tbody>
@@ -574,6 +590,22 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
 
     </div><!-- /dj-grid -->
 
+    <!-- CAPITAL ALLOCATION -->
+    <div style="margin-top:20px">
+      <div class="dj-section-title" style="font-size:11px;font-weight:700;color:var(--blue);text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px;padding-bottom:4px;border-bottom:2px solid var(--blue);display:inline-block">Capital Allocation per Strategy (%)</div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-top:12px">
+        ${['aggressive','balanced','conservative'].map(prof => `
+        <div>
+          <div style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">${prof.charAt(0).toUpperCase()+prof.slice(1)}</div>
+          ${['ptj','statArb','multiFactor','allWeather'].map(strat => `
+          <div class="slider-row">
+            <div class="slider-label"><span>${strat==='ptj'?'PTJ Trend':strat==='statArb'?'Stat-Arb':strat==='multiFactor'?'Multi-Factor':'All-Weather'}</span><span id="lbl-ca-${prof}-${strat}">25%</span></div>
+            <input type="range" id="ca-${prof}-${strat}" min="0" max="100" step="5" value="25" oninput="updateLabel('lbl-ca-${prof}-${strat}',this.value+'%')">
+          </div>`).join('')}
+        </div>`).join('')}
+      </div>
+    </div>
+
     <!-- BUTTONS & LOG -->
     <div class="btn-row">
       <button class="btn-primary" onclick="applyChanges()">✅ Apply Changes</button>
@@ -589,65 +621,21 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
   </div><!-- /dj-body -->
 </div><!-- /section -->
 
-<!-- DAILY INTELLIGENCE REPORT -->
-<div class="section" id="analyst-section">
-  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
-    <div>
-      <h2 style="margin:0">Daily Intelligence Report</h2>
-      <div style="font-size:11px;color:var(--muted);margin-top:3px">Generated by Claude Haiku · runs at 08:00 UTC</div>
-    </div>
-    <button class="btn-primary" id="gen-report-btn" onclick="generateReport()" style="font-size:12px;padding:8px 16px">Generate Report Now</button>
-  </div>
-  <div id="analyst-report-content">
-    <div style="color:var(--muted);text-align:center;padding:24px">Loading report...</div>
-  </div>
-</div>
 
 </div><!-- /main -->
 
 <script>
 const ASSETS = ${JSON.stringify(ALL_ASSETS)};
-let equityChart = null;
-let chartData = { labels:[], datasets:[] };
-
-// ─── CHART INIT ──────────────────────────────────────────────────────────────
-function initChart() {
-  const ctx = document.getElementById('equity-chart').getContext('2d');
-  equityChart = new Chart(ctx, {
-    type:'line',
-    data:{ labels:[], datasets:[
-      { label:'Total',        data:[], borderColor:'#1a202c', backgroundColor:'rgba(26,32,44,.05)', fill:true,  tension:.3, borderWidth:2.5, pointRadius:0 },
-      { label:'Aggressive',   data:[], borderColor:'#e53e3e', fill:false, tension:.3, borderWidth:1.5, pointRadius:0 },
-      { label:'Balanced',     data:[], borderColor:'#3182ce', fill:false, tension:.3, borderWidth:1.5, pointRadius:0 },
-      { label:'Conservative', data:[], borderColor:'#00b341', fill:false, tension:.3, borderWidth:1.5, pointRadius:0 },
-    ]},
-    options:{
-      responsive:true, maintainAspectRatio:false,
-      plugins:{ legend:{ position:'bottom', labels:{ boxWidth:10, font:{size:11} } } },
-      scales:{
-        x:{ display:true, ticks:{ maxTicksLimit:6, font:{size:10} }, grid:{display:false} },
-        y:{ display:true, ticks:{ font:{size:10}, callback:v=>'£'+v.toFixed(0) }, grid:{ color:'#f0f2f5' } },
-      },
-      interaction:{ mode:'index', intersect:false },
-    },
-  });
-
-  ['ptj','stat','mf'].forEach((k,i) => {
-    document.getElementById('toggle-'+k).addEventListener('change', e => {
-      equityChart.data.datasets[i+1].hidden = !e.target.checked;
-      equityChart.update();
-    });
-  });
-}
 
 // ─── DATA REFRESH ────────────────────────────────────────────────────────────
 async function refresh() {
   try {
-    const [dataResp, sentResp, btResp, scorecardResp] = await Promise.all([
+    const [dataResp, sentResp, btResp, scorecardResp, pnlResp] = await Promise.all([
       fetch('/api/data').then(r=>r.json()),
       fetch('/api/sentiment').then(r=>r.json()),
       fetch('/api/backtest').then(r=>r.json()),
       fetch('/api/scorecard').then(r=>r.json()),
+      fetch('/api/pnl-summary').then(r=>r.json()),
     ]);
 
     const { state, trades, weights } = dataResp;
@@ -655,7 +643,7 @@ async function refresh() {
 
     updateHeader(state);
     updateStatCards(state, trades);
-    updateEquityCurve(state);
+    updatePnlSummary(pnlResp);
     updateHeatmap(state, trades);
     updateScorecard(scorecardResp);
     updatePositions(state);
@@ -729,18 +717,6 @@ function updateStatCards(state, trades) {
   document.getElementById('s-unrealised-sub').textContent = openCount + (openCount===1?' position':' positions') + ' open';
   document.getElementById('unrealised-pnl-card').className = 'stat-card ' + (unrealisedPnl>=0?'green':'red');
 
-  // Portfolio heat (simplified)
-  const heat = Object.values(ports).reduce((s,p)=>{
-    if (!p.nav || p.nav===0) return s;
-    const h = (p.positions||[]).reduce((hs,pos)=>{
-      const slPct = pos.entryPrice > 0 ? Math.abs(pos.entryPrice - pos.stopLoss)/pos.entryPrice : 0;
-      return hs + pos.qty * pos.entryPrice * slPct;
-    },0) / p.nav;
-    return s + h;
-  },0) / 3;
-  document.getElementById('s-heat').textContent = (heat*100).toFixed(1)+'%';
-  document.getElementById('s-heat').className = 'stat-value ' + (heat>0.5?'dn':heat>0.3?'':' up');
-
   // Best strategy today
   const stratPnls = {};
   for (const t of (trades||[])) {
@@ -750,18 +726,6 @@ function updateStatCards(state, trades) {
   const bestStrat = Object.entries(stratPnls).sort((a,b)=>b[1]-a[1])[0];
   document.getElementById('s-best').textContent = bestStrat ? stratLabel(bestStrat[0]) : '—';
   document.getElementById('s-best-sub').textContent = bestStrat ? '£'+bestStrat[1].toFixed(2) : 'no trades';
-}
-
-function updateEquityCurve(state) {
-  const ec = state.equityCurve || [];
-  if (!ec.length) return;
-  const labels = ec.map(p => new Date(p.timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}));
-  equityChart.data.labels = labels;
-  equityChart.data.datasets[0].data = ec.map(p=>p.total||1000);
-  equityChart.data.datasets[1].data = ec.map(p=>p.aggressive||333);
-  equityChart.data.datasets[2].data = ec.map(p=>p.balanced||334);
-  equityChart.data.datasets[3].data = ec.map(p=>p.conservative||333);
-  equityChart.update('none');
 }
 
 function updateHeatmap(state, trades) {
@@ -805,6 +769,27 @@ function updateHeatmap(state, trades) {
   }).join('');
 }
 
+function updatePnlSummary(data) {
+  if (!data) return;
+  const tbody = document.getElementById('pnl-summary-body');
+  const fmt = (v) => {
+    const sign = v >= 0 ? '+' : '−';
+    const cls  = v >= 0 ? 'up' : 'dn';
+    const lbl  = v >= 0 ? '▲' : '▼';
+    return \`<span class="\${cls}">\${sign}£\${Math.abs(v).toFixed(2)} <span class="pnl-label \${v>=0?'pnl-label-profit':'pnl-label-loss'}">\${lbl}</span></span>\`;
+  };
+  const periods = ['today','week','month','allTime'];
+  const rows = [
+    ['Realised P&L', ...periods.map(p => fmt(data[p]?.pnl || 0))],
+    ['Trades',       ...periods.map(p => String(data[p]?.trades || 0))],
+    ['Win Rate',     ...periods.map(p => data[p]?.trades ? ((data[p].wr||0)*100).toFixed(0)+'%' : '—')],
+    ['Unrealised P&L', fmt(data.unrealised || 0), '—', '—', '—'],
+  ];
+  tbody.innerHTML = rows.map(row =>
+    \`<tr><td><strong>\${row[0]}</strong></td>\${row.slice(1).map(v=>\`<td>\${v}</td>\`).join('')}</tr>\`
+  ).join('');
+}
+
 function updateScorecard(scorecard) {
   const strats = ['ptj','statArb','multiFactor','allWeather'];
   const profiles = ['aggressive','balanced','conservative'];
@@ -812,13 +797,15 @@ function updateScorecard(scorecard) {
 
   tbody.innerHTML = strats.map(strat => {
     const cols = profiles.map(prof => {
-      const m = (scorecard && scorecard[strat] && scorecard[strat][prof]) || { wr:0, sharpe:0, maxDD:0, trades:0, pnl:0, wt:0.25 };
+      const m = (scorecard && scorecard[strat] && scorecard[strat][prof]) || { wr:0, sharpe:0, maxDD:0, trades:0, pnl:0, wt:0.25, avgWin:0, avgLoss:0 };
       const sharpeClass = m.sharpe>1?'sharpe-green':m.sharpe>0?'sharpe-yellow':'sharpe-red';
       return \`<td style="border-left:2px solid var(--border)">\${(m.wr*100).toFixed(0)}%</td>
         <td class="\${sharpeClass}">\${m.sharpe.toFixed(2)}</td>
         <td>\${m.maxDD>0?'-£'+m.maxDD.toFixed(2):'—'}</td>
         <td>\${m.trades}</td>
         <td class="\${m.pnl>=0?'up':'dn'}">\${m.pnl>=0?'+':'−'}£\${Math.abs(m.pnl).toFixed(2)} <span class="pnl-label \${m.pnl>=0?'pnl-label-profit':'pnl-label-loss'}">\${m.pnl>=0?'▲':'▼'}</span></td>
+        <td class="up">\${m.avgWin!==0?'+£'+Math.abs(m.avgWin).toFixed(2):'—'}</td>
+        <td class="dn">\${m.avgLoss!==0?'-£'+Math.abs(m.avgLoss).toFixed(2):'—'}</td>
         <td>\${(m.wt*100).toFixed(0)}%</td>\`;
     }).join('');
     return \`<tr><td><strong>\${stratLabel(strat)}</strong></td>\${cols}</tr>\`;
@@ -1009,6 +996,17 @@ async function loadConfigIntoConsole() {
       const el = document.getElementById('asset-'+a.replace('=','_'));
       if (el) el.checked = cfg.enabledAssets ? cfg.enabledAssets[a] !== false : true;
     });
+
+    const ca = cfg.capitalAllocation || {};
+    ['aggressive','balanced','conservative'].forEach(prof => {
+      const profCa = ca[prof] || {};
+      ['ptj','statArb','multiFactor','allWeather'].forEach(strat => {
+        const val = profCa[strat] !== undefined ? profCa[strat] : 25;
+        setSlider(\`ca-\${prof}-\${strat}\`, val);
+        const lbl = document.getElementById(\`lbl-ca-\${prof}-\${strat}\`);
+        if (lbl) lbl.textContent = val + '%';
+      });
+    });
   } catch(e) { console.error('Config load error:', e); }
 }
 
@@ -1044,6 +1042,12 @@ async function applyChanges() {
     equitiesMax:       parseInt(document.getElementById('equitiesMax').value),
     commoditiesMax:    parseInt(document.getElementById('commoditiesMax').value),
     enabledAssets,
+    capitalAllocation: Object.fromEntries(['aggressive','balanced','conservative'].map(prof => [
+      prof,
+      Object.fromEntries(['ptj','statArb','multiFactor','allWeather'].map(strat => [
+        strat, parseInt(document.getElementById(\`ca-\${prof}-\${strat}\`)?.value || 25)
+      ]))
+    ])),
   };
 
   const resp = await fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(cfg) });
@@ -1120,72 +1124,10 @@ function fmtPrice(p) {
   return p > 1000 ? p.toFixed(0) : p > 1 ? p.toFixed(2) : p.toFixed(4);
 }
 
-// ─── ANALYST REPORT ──────────────────────────────────────────────────────────
-async function loadAnalystReport() {
-  const el = document.getElementById('analyst-report-content');
-  try {
-    const report = await fetch('/api/analyst-report').then(r => r.json());
-    if (!report) {
-      el.innerHTML = '<div style="color:var(--muted);text-align:center;padding:24px">No report yet — click "Generate Report Now" to create one.</div>';
-      return;
-    }
-    const pnlSign  = report.todayPnl >= 0 ? '+' : '−';
-    const pnlColor = report.todayPnl >= 0 ? 'var(--green)' : 'var(--red)';
-    const pnlLabel = report.todayPnl >= 0 ? '▲ PROFIT' : '▼ LOSS';
-    const genTime  = new Date(report.generatedAt).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
-
-    const bodyHtml = (report.text || '')
-      .replace(/^## (.+)$/gm, '<h2>$1</h2>')
-      .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
-      .replace(/^- (.+)$/gm, '<li>$1</li>')
-      .replace(/(<li>[\\s\\S]*?<\\/li>)+/g, m => \`<ul>\${m}</ul>\`)
-      .replace(/\\n{2,}/g, '</p><p>')
-      .replace(/\\n/g, '<br>');
-
-    const cfgBlock = report.configChangesApplied ? \`
-      <div class="config-applied">
-        <div class="config-applied-title">Config Changes Applied Automatically</div>
-        <pre>\${JSON.stringify(report.configChangesApplied, null, 2)}</pre>
-      </div>\` : '';
-
-    el.innerHTML = \`
-      <div class="report-meta">
-        <span>📅 <strong>\${report.date}</strong></span>
-        <span>⏱ Generated \${genTime}</span>
-        <span>💼 NAV: <strong>£\${(report.nav||0).toFixed(2)}</strong></span>
-        <span style="color:\${pnlColor}">Today P&L: <strong>\${pnlSign}£\${Math.abs(report.todayPnl||0).toFixed(2)} \${pnlLabel}</strong></span>
-      </div>
-      <div class="report-body"><p>\${bodyHtml}</p></div>
-      \${cfgBlock}\`;
-  } catch(e) {
-    el.innerHTML = '<div style="color:var(--red);padding:12px">Failed to load report: ' + e.message + '</div>';
-  }
-}
-
-async function generateReport() {
-  const btn = document.getElementById('gen-report-btn');
-  btn.disabled = true;
-  btn.textContent = 'Generating...';
-  try {
-    const r = await fetch('/api/generate-report', { method: 'POST' });
-    if (!r.ok) { const e = await r.json(); throw new Error(e.error || 'Unknown error'); }
-    showToast('Report generation started — refresh in 10 seconds');
-    setTimeout(() => loadAnalystReport(), 12000);
-  } catch(e) {
-    showToast('Error: ' + e.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Generate Report Now';
-  }
-}
-
 // ─── INIT ────────────────────────────────────────────────────────────────────
-initChart();
 loadConfigIntoConsole();
 refresh();
-loadAnalystReport();
 setInterval(refresh, 10000); // refresh every 10 seconds
-setInterval(loadAnalystReport, 120000); // refresh report every 2 minutes
 </script>
 </body>
 </html>`;
