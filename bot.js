@@ -704,6 +704,7 @@ function openPosition(profile, strategy, asset, side, cfg) {
   if (!layer4_portfolioChecks()) return null;
   if (!layer2_checkStrategy(profile, strategy)) return null;
   if (!(config.enabledAssets?.[asset] !== false)) return null;
+  if ((config.capitalAllocation?.[profile]?.[strategy] ?? 100) === 0) return null;
 
   const port  = state.portfolios[profile];
   const prof  = PROFILES[profile];
