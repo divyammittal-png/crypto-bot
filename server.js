@@ -247,16 +247,13 @@ app.get('/api/forecast', async (req, res) => {
         return (isNaN(day) || mon === undefined || isNaN(yr)) ? null : new Date(yr, mon, day).getTime();
       }
 
-      // Pick expiry with the most total open interest (most liquid)
-      const oiByExpiry = {};
-      for (const o of calls) {
-        const exp = parseExpiry(o.instrument_name);
-        if (!exp) continue;
-        oiByExpiry[exp] = (oiByExpiry[exp] || 0) + (o.open_interest || 0);
-      }
-      const expiries = Object.keys(oiByExpiry).map(Number);
+      // Exclude expiries < 7 days out; from the rest pick closest to 30 days
+      const now7  = Date.now() + 7  * 24 * 60 * 60 * 1000;
+      const now30 = Date.now() + 30 * 24 * 60 * 60 * 1000;
+      const expiries = [...new Set(calls.map(o => parseExpiry(o.instrument_name)).filter(Boolean))]
+        .filter(e => e >= now7);
       if (!expiries.length) throw new Error('Could not parse any expiries');
-      const bestExpiry = expiries.reduce((a, b) => oiByExpiry[a] >= oiByExpiry[b] ? a : b);
+      const bestExpiry = expiries.reduce((a, b) => Math.abs(a - now30) <= Math.abs(b - now30) ? a : b);
 
       // Build strike→delta map for the chosen expiry
       const chain = {};
@@ -268,11 +265,11 @@ app.get('/api/forecast', async (req, res) => {
       const chainStrikes = Object.keys(chain).map(Number).sort((a, b) => a - b);
       if (!chainStrikes.length) throw new Error('Empty chain for chosen expiry');
 
-      // Resolve delta per target (exact match or linear interpolation)
+      // Resolve delta: exact match, then interpolate within ±5000 of target
       probabilityLevels = targets.map(K => {
         if (chain[K] !== undefined) return { price: K, probability: chain[K] };
-        const below = chainStrikes.filter(s => s < K);
-        const above = chainStrikes.filter(s => s > K);
+        const below = chainStrikes.filter(s => s >= K - 5000 && s < K);
+        const above = chainStrikes.filter(s => s > K && s <= K + 5000);
         if (!below.length && !above.length) return { price: K, probability: null };
         if (!below.length) return { price: K, probability: chain[above[0]] };
         if (!above.length) return { price: K, probability: chain[below[below.length - 1]] };
