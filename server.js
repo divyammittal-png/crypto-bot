@@ -58,7 +58,15 @@ function svrGet(url) {
     const u = new URL(url);
     const req = https.request(
       { hostname: u.hostname, path: u.pathname + u.search, method: 'GET', headers: { Accept: 'application/json' } },
-      res => { let d = ''; res.on('data', c => d += c); res.on('end', () => resolve(d)); }
+      res => {
+        let d = '';
+        res.on('data', c => d += c);
+        res.on('end', () => {
+          if (res.statusCode >= 400)
+            return reject(Object.assign(new Error(`HTTP ${res.statusCode}`), { statusCode: res.statusCode, body: d }));
+          resolve(d);
+        });
+      }
     );
     req.on('error', reject);
     req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
@@ -269,7 +277,10 @@ app.get('/api/forecast', async (req, res) => {
       });
 
       source = 'deribit-options';
-    } catch(_) {
+    } catch(e) {
+      console.error('[FORECAST] Deribit options fetch failed —', e.message,
+        e.statusCode ? `status=${e.statusCode}` : '',
+        e.body       ? `body=${String(e.body).slice(0, 500)}` : '');
       // Fallback: log-normal model
       const T = 30 / 365;
       probabilityLevels = targets.map(K => ({
