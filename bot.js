@@ -72,6 +72,7 @@ function initState() {
     equityCurve:     [],
     lastUpdate:      null,
     livePrices:      {},
+    impliedVol:      null,
   };
 }
 
@@ -129,6 +130,22 @@ async function fetchKlines(asset) {
   } catch(e) {
     log(`[CG] ${asset} fetch error: ${e.message}`);
     return false;
+  }
+}
+
+// ─── DERIBIT DVOL ─────────────────────────────────────────────────────────────
+async function fetchDVOL() {
+  try {
+    const url = 'https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=3600&count=1';
+    const data = await httpsGetJSON(url);
+    const entry = data?.result?.data?.[0];
+    if (entry) {
+      const dvol = entry[4] != null ? entry[4] : entry[1];
+      state.impliedVol = dvol / 100;
+      log(`[DVOL] BTC implied vol: ${(state.impliedVol * 100).toFixed(1)}%`);
+    }
+  } catch(e) {
+    log(`[DVOL] Error: ${e.message}`);
   }
 }
 
@@ -387,11 +404,17 @@ async function start() {
   }
 
   await tick();
+  await fetchDVOL();
 
   setInterval(async () => {
     try { await tick(); }
     catch(e) { log(`[LOOP] Error: ${e.message}`); }
   }, POLL_MS);
+
+  setInterval(async () => {
+    try { await fetchDVOL(); saveJSON(F.state, state); }
+    catch(e) { log(`[DVOL] Interval error: ${e.message}`); }
+  }, 60 * 60 * 1000);
 
   log('[BOT] Running. Polling Binance every 5 minutes.');
 }

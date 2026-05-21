@@ -5,6 +5,7 @@
 const express = require('express');
 const fs      = require('fs');
 const path    = require('path');
+const https   = require('https');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -51,6 +52,27 @@ const PRESETS = {
 
 function loadJSON(f) { try { return JSON.parse(fs.readFileSync(f,'utf8')); } catch { return null; } }
 function saveJSON(f,d) { try { fs.writeFileSync(f,JSON.stringify(d,null,2)); } catch(e) { console.error(e); } }
+
+function svrGet(url) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const req = https.request(
+      { hostname: u.hostname, path: u.pathname + u.search, method: 'GET', headers: { Accept: 'application/json' } },
+      res => { let d = ''; res.on('data', c => d += c); res.on('end', () => resolve(d)); }
+    );
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
+    req.end();
+  });
+}
+
+function normCDF(x) {
+  const t = 1 / (1 + 0.2316419 * Math.abs(x));
+  const d = Math.exp(-x * x / 2) / Math.sqrt(2 * Math.PI);
+  const poly = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+  const p = 1 - d * poly;
+  return x >= 0 ? p : 1 - p;
+}
 
 app.use(express.json());
 
@@ -170,6 +192,44 @@ app.get('/api/pnl-summary', (req, res) => {
   });
 });
 
+// ─── FORECAST API ─────────────────────────────────────────────────────────────
+app.get('/api/forecast', async (req, res) => {
+  try {
+    const state = loadJSON(F.state) || {};
+    const S = state.livePrices?.BTC?.price || 0;
+
+    let impliedVol = state.impliedVol || 0.70;
+    try {
+      const raw = JSON.parse(await svrGet('https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=3600&count=1'));
+      const entry = raw?.result?.data?.[0];
+      if (entry) impliedVol = (entry[4] != null ? entry[4] : entry[1]) / 100;
+    } catch(_) { /* use stored/fallback value */ }
+
+    const ph = loadJSON(dataPath('price-history.json')) || {};
+    const closes = ph.BTC?.closes || [];
+    const histLen = Math.min(closes.length, 48);
+    const priceHistory = closes.slice(-histLen).map((p, i) => ({
+      t: Date.now() - (histLen - 1 - i) * 3600000,
+      p,
+    }));
+
+    const T = 30 / 365;
+    const sigma = impliedVol;
+    const targets = [70000, 75000, 80000, 85000, 90000, 95000];
+    const probabilityLevels = targets.map(K => ({
+      price: K,
+      probability: S > 0 ? normCDF(Math.log(K / S) / (sigma * Math.sqrt(T))) : 0,
+    }));
+
+    const upperBand = Array.from({ length: 30 }, (_, i) => S * Math.exp(sigma * Math.sqrt((i + 1) / 365)));
+    const lowerBand = Array.from({ length: 30 }, (_, i) => S * Math.exp(-sigma * Math.sqrt((i + 1) / 365)));
+
+    res.json({ currentPrice: S, impliedVol, probabilityLevels, priceHistory, upperBand, lowerBand });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── DASHBOARD ────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.send(DASHBOARD_HTML));
 
@@ -180,6 +240,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>APEX BOT — Hedge Fund Grade Trading System</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3/dist/chartjs-plugin-annotation.min.js"></script>
 <style>
 :root {
   --bg:#ffffff; --bg2:#f8f9fa; --bg3:#f0f2f5;
@@ -439,6 +501,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
     <div class="tab" onclick="switchTab('positions',this)">Open Positions</div>
     <div class="tab" onclick="switchTab('trades',this)">Trade History</div>
     <div class="tab" onclick="switchTab('macro',this)">Macro &amp; Sentiment</div>
+    <div class="tab" onclick="switchTab('forecast',this)">Price Forecast</div>
   </div>
 
   <!-- SCORECARD -->
@@ -482,6 +545,14 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
         <tbody id="trades-body"></tbody>
       </table>
     </div>
+  </div>
+
+  <!-- PRICE FORECAST -->
+  <div id="tab-forecast" class="tab-content">
+    <div style="position:relative;height:440px">
+      <canvas id="forecast-chart"></canvas>
+    </div>
+    <div id="forecast-meta" style="margin-top:12px;font-size:12px;color:var(--muted);display:flex;gap:20px;flex-wrap:wrap;padding:4px 0"></div>
   </div>
 
   <!-- MACRO & SENTIMENT -->
@@ -1092,12 +1163,132 @@ function showToast(msg) {
   setTimeout(() => t.remove(), 3000);
 }
 
+// ─── PRICE FORECAST ──────────────────────────────────────────────────────────
+let forecastChart = null;
+
+async function loadForecast() {
+  try {
+    const data = await fetch('/api/forecast').then(r => r.json());
+    if (!data.currentPrice) return;
+    const { currentPrice, impliedVol, probabilityLevels, priceHistory, upperBand, lowerBand } = data;
+    const ivPct = (impliedVol * 100).toFixed(1);
+
+    const histLabels = priceHistory.map(p =>
+      new Date(p.t).toLocaleString([], { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' })
+    );
+    const histPrices = priceHistory.map(p => p.p);
+
+    const fwdLabels = Array.from({ length: 30 }, (_, i) => {
+      const d = new Date(); d.setDate(d.getDate() + i + 1);
+      return d.toLocaleDateString([], { month:'short', day:'numeric' });
+    });
+
+    const labels    = [...histLabels, ...fwdLabels];
+    const histData  = [...histPrices, ...Array(30).fill(null)];
+    const upperData = [...Array(histPrices.length).fill(null), ...upperBand];
+    const lowerData = [...Array(histPrices.length).fill(null), ...lowerBand];
+
+    const annotations = {};
+    for (const { price, probability } of probabilityLevels) {
+      annotations['lvl_' + price] = {
+        type: 'line', yMin: price, yMax: price,
+        borderColor: 'rgba(113,128,150,0.45)', borderWidth: 1, borderDash: [4, 4],
+        label: {
+          display: true,
+          content: '$' + (price / 1000).toFixed(0) + 'k  ' + (probability * 100).toFixed(1) + '%',
+          position: 'end', backgroundColor: 'transparent',
+          color: '#718096', font: { size: 10 },
+        },
+      };
+    }
+    if (histLabels.length) {
+      annotations['now'] = {
+        type: 'line',
+        xMin: histLabels[histLabels.length - 1], xMax: histLabels[histLabels.length - 1],
+        borderColor: 'rgba(255,255,255,0.55)', borderWidth: 1, borderDash: [4, 4],
+        label: { display: true, content: 'Now', position: 'start', backgroundColor: 'transparent', color: '#718096', font: { size: 10 } },
+      };
+    }
+
+    const ctx = document.getElementById('forecast-chart').getContext('2d');
+    if (forecastChart) forecastChart.destroy();
+    forecastChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          {
+            label: 'BTC Price (Actual)',
+            data: histData,
+            borderColor: '#ffffff',
+            borderWidth: 2,
+            pointRadius: 0,
+            tension: 0.1,
+            fill: false,
+            order: 1,
+          },
+          {
+            label: '+1σ Upper Band',
+            data: upperData,
+            borderColor: 'rgba(0,179,65,0.85)',
+            borderWidth: 1.5,
+            borderDash: [5, 4],
+            pointRadius: 0,
+            fill: { target: { value: currentPrice }, above: 'rgba(0,179,65,0.12)', below: 'transparent' },
+            order: 2,
+          },
+          {
+            label: '−1σ Lower Band',
+            data: lowerData,
+            borderColor: 'rgba(229,62,62,0.85)',
+            borderWidth: 1.5,
+            borderDash: [5, 4],
+            pointRadius: 0,
+            fill: { target: { value: currentPrice }, above: 'transparent', below: 'rgba(229,62,62,0.12)' },
+            order: 3,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { labels: { color: '#718096', font: { size: 11 }, boxWidth: 20 } },
+          tooltip: { callbacks: { label: ctx => ctx.dataset.label + ': $' + (ctx.parsed.y || 0).toFixed(0) } },
+          annotation: { annotations },
+        },
+        scales: {
+          x: {
+            ticks: { color: '#718096', font: { size: 10 }, maxTicksLimit: 14, maxRotation: 0 },
+            grid: { color: 'rgba(226,232,240,0.5)' },
+          },
+          y: {
+            ticks: { color: '#718096', font: { size: 10 }, callback: v => '$' + (v / 1000).toFixed(0) + 'k' },
+            grid: { color: 'rgba(226,232,240,0.5)' },
+          },
+        },
+      },
+    });
+
+    document.getElementById('forecast-meta').innerHTML =
+      \`<span>Current price: <strong>$\${currentPrice.toFixed(0)}</strong></span>\` +
+      \`<span>Deribit DVOL: <strong>\${ivPct}% ann.</strong></span>\` +
+      \`<span>Cone = ±1σ over 30 days</span> \` +
+      probabilityLevels.map(l =>
+        \`<span>$\${(l.price/1000).toFixed(0)}k: <strong>\${(l.probability*100).toFixed(1)}%</strong></span>\`
+      ).join('');
+  } catch(e) { console.error('Forecast error:', e); }
+}
+
 // ─── UTILS ──────────────────────────────────────────────────────────────────
 function switchTab(id, el) {
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
   document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
   el.classList.add('active');
   document.getElementById('tab-'+id).classList.add('active');
+  if (id === 'forecast') loadForecast();
 }
 
 function stratLabel(s) {
