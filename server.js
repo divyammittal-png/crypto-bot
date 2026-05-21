@@ -236,18 +236,16 @@ app.get('/api/forecast', async (req, res) => {
       const calls = options.filter(o => o.instrument_name?.endsWith('-C'));
       if (!calls.length) throw new Error('No call options returned');
 
-      // Parse expiry date from name like "BTC-20JUN25-90000-C"
+      // Parse expiry date from name like "BTC-25MAY26-74000-C" (DDMMMYY, two-digit year)
       const MONTHS = { JAN:0, FEB:1, MAR:2, APR:3, MAY:4, JUN:5, JUL:6, AUG:7, SEP:8, OCT:9, NOV:10, DEC:11 };
       function parseExpiry(name) {
-        const s = name.split('-')[1]; // "20JUN25"
+        const s = name.split('-')[1]; // "25MAY26"
         if (!s || s.length < 7) return null;
         const day = parseInt(s.slice(0, 2));
         const mon = MONTHS[s.slice(2, 5)];
-        const yr  = 2000 + parseInt(s.slice(5));
+        const yr  = 2000 + parseInt(s.slice(5)); // "26" → 2026
         return (isNaN(day) || mon === undefined || isNaN(yr)) ? null : new Date(yr, mon, day).getTime();
       }
-
-      console.log('[FORECAST] Sample instruments:', calls.slice(0, 5).map(o => o.instrument_name));
 
       // Pick expiry with the most total open interest (most liquid)
       const oiByExpiry = {};
