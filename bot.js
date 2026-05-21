@@ -165,7 +165,7 @@ async function fetchDVOL() {
   try {
     const data = await httpsPostJSON('https://www.deribit.com/api/v2/public/get_volatility_index_data', {
       jsonrpc: '2.0', id: 2, method: 'public/get_volatility_index_data',
-      params: { currency_pair: 'btc_usd', resolution: '3600', count: 1 },
+      params: { currency: 'BTC', start_timestamp: Date.now() - 3600000, end_timestamp: Date.now(), resolution: '3600' },
     });
     const entry = data?.result?.data?.[0];
     if (entry) {
