@@ -74,6 +74,33 @@ function svrGet(url) {
   });
 }
 
+function deribitPost(method, params) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
+    const req = https.request(
+      { hostname: 'www.deribit.com', path: '/api/v2/' + method, method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), Accept: 'application/json' } },
+      res => {
+        let d = '';
+        res.on('data', c => d += c);
+        res.on('end', () => {
+          if (res.statusCode >= 400)
+            return reject(Object.assign(new Error(`HTTP ${res.statusCode}`), { statusCode: res.statusCode, body: d }));
+          try {
+            const parsed = JSON.parse(d);
+            if (parsed.error) return reject(Object.assign(new Error(parsed.error.message), { code: parsed.error.code }));
+            resolve(parsed.result);
+          } catch(e) { reject(e); }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
+    req.write(body);
+    req.end();
+  });
+}
+
 function normCDF(x) {
   const t = 1 / (1 + 0.2316419 * Math.abs(x));
   const d = Math.exp(-x * x / 2) / Math.sqrt(2 * Math.PI);
@@ -209,8 +236,8 @@ app.get('/api/forecast', async (req, res) => {
     // DVOL for cone bands
     let impliedVol = state.impliedVol || 0.70;
     try {
-      const raw = JSON.parse(await svrGet('https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=3600&count=1'));
-      const entry = raw?.result?.data?.[0];
+      const dv = await deribitPost('public/get_volatility_index_data', { currency_pair: 'btc_usd', resolution: '3600', count: 1 });
+      const entry = dv?.data?.[0];
       if (entry) impliedVol = (entry[4] != null ? entry[4] : entry[1]) / 100;
     } catch(_) { /* use stored/fallback value */ }
 
@@ -229,8 +256,8 @@ app.get('/api/forecast', async (req, res) => {
 
     try {
       // Fetch full BTC options book from Deribit
-      const optRaw = JSON.parse(await svrGet('https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option'));
-      const options = optRaw?.result || [];
+      const options = await deribitPost('public/get_book_summary_by_currency', { currency: 'BTC', kind: 'option' });
+      if (!Array.isArray(options)) throw new Error('Unexpected options response');
 
       // Filter calls only
       const calls = options.filter(o => o.instrument_name?.endsWith('-C'));

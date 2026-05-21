@@ -101,6 +101,33 @@ async function httpsGetJSON(url, extraHeaders = {}) {
   return JSON.parse(await httpsGet(url, extraHeaders));
 }
 
+function httpsPost(url, bodyObj) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const payload = JSON.stringify(bodyObj);
+    const req = https.request(
+      { hostname: u.hostname, path: u.pathname, method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), Accept: 'application/json' } },
+      res => {
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => {
+          if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}`));
+          resolve(data);
+        });
+      }
+    );
+    req.on('error', reject);
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error('Timeout')); });
+    req.write(payload);
+    req.end();
+  });
+}
+
+async function httpsPostJSON(url, bodyObj) {
+  return JSON.parse(await httpsPost(url, bodyObj));
+}
+
 // ─── COINGECKO DATA ───────────────────────────────────────────────────────────
 async function fetchKlines(asset) {
   const id  = CG_IDS[asset];
@@ -136,22 +163,15 @@ async function fetchKlines(asset) {
 // ─── DERIBIT DVOL ─────────────────────────────────────────────────────────────
 async function fetchDVOL() {
   try {
-    const d1 = await httpsGetJSON('https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd');
-    if (d1?.result?.volatility != null) {
-      state.impliedVol = d1.result.volatility / 100;
-      log(`[DVOL] BTC implied vol: ${(state.impliedVol * 100).toFixed(1)}% (index_price)`);
-      return;
-    }
-  } catch(e) {
-    log(`[DVOL] get_index_price failed (${e.message}), trying daily DVOL`);
-  }
-  try {
-    const d2 = await httpsGetJSON('https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=86400&count=7');
-    const entry = d2?.result?.data?.[0];
+    const data = await httpsPostJSON('https://www.deribit.com/api/v2/public/get_volatility_index_data', {
+      jsonrpc: '2.0', id: 2, method: 'public/get_volatility_index_data',
+      params: { currency_pair: 'btc_usd', resolution: '3600', count: 1 },
+    });
+    const entry = data?.result?.data?.[0];
     if (entry) {
       const dvol = entry[4] != null ? entry[4] : entry[1];
       state.impliedVol = dvol / 100;
-      log(`[DVOL] BTC implied vol: ${(state.impliedVol * 100).toFixed(1)}% (dvol-daily)`);
+      log(`[DVOL] BTC implied vol: ${(state.impliedVol * 100).toFixed(1)}%`);
     }
   } catch(e) {
     log(`[DVOL] Error: ${e.message}`);
