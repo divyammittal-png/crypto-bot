@@ -1,241 +1,139 @@
 'use strict';
-const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-// ══════════════════════════════════════════════════════════════════════════════
-// APEX BOT — Hedge Fund Grade Autonomous Trading System
-// ══════════════════════════════════════════════════════════════════════════════
 const https = require('https');
-const http  = require('http');
 const fs    = require('fs');
 const path  = require('path');
 
-
-// ─── PERSISTENT STORAGE ───────────────────────────────────────────────────────
 const { dataPath, migrate } = require('./storage');
-migrate(); // copy local files → /data on first volume mount
+migrate();
 
-// ─── FILE PATHS ────────────────────────────────────────────────────────────────
+// ─── FILE PATHS ───────────────────────────────────────────────────────────────
 const F = {
-  state:    dataPath('state.json'),
-  trades:   dataPath('trades.json'),
-  learning: dataPath('learning.json'),
-  weights:  dataPath('strategy-weights.json'),
-  reports:  dataPath('reports.json'),
-  config:   dataPath('config.json'),
-  configLog:dataPath('config-log.json'),
-  backtest: dataPath('backtest-results.json'),
-  priceHistory: dataPath('price-history.json'),
+  state:       dataPath('state.json'),
+  trades:      dataPath('trades.json'),
+  learning:    dataPath('learning.json'),
+  weights:     dataPath('strategy-weights.json'),
+  reports:     dataPath('reports.json'),
+  config:      dataPath('config.json'),
+  configLog:   dataPath('config-log.json'),
+  backtest:    dataPath('backtest-results.json'),
+  priceHistory:dataPath('price-history.json'),
 };
 
-// ─── ASSET UNIVERSE ───────────────────────────────────────────────────────────
-const CLASSES = {
-  crypto: ['BTC','ETH','SOL','BNB','XRP'],
-};
-const ALL_ASSETS = [...CLASSES.crypto];
-const ASSET_CLASS = {};
-for (const [cls, arr] of Object.entries(CLASSES)) arr.forEach(a => ASSET_CLASS[a] = cls);
-
-const CG_IDS = { BTC:'bitcoin',ETH:'ethereum',SOL:'solana',BNB:'binancecoin',XRP:'ripple' };
-
-// ─── STAT-ARB PAIRS ──────────────────────────────────────────────────────────
-const PAIRS = [
-  ['BTC','ETH'],['BTC','SOL'],['ETH','SOL'],['BNB','ETH'],
-];
-
-// ─── RISK PROFILES ────────────────────────────────────────────────────────────
-const PROFILES = {
-  aggressive:   { capital:333, kelly:0.75, maxRisk:0.030, tp:0.09, sl:0.030, maxHeat:0.70 },
-  balanced:     { capital:334, kelly:0.50, maxRisk:0.010, tp:0.06, sl:0.020, maxHeat:0.50 },
-  conservative: { capital:333, kelly:0.25, maxRisk:0.005, tp:0.03, sl:0.010, maxHeat:0.30 },
-};
-
-// ─── DEFAULT CONFIG ───────────────────────────────────────────────────────────
-const DEFAULT_CONFIG = {
-  strategyWeights: { ptj:1, statArb:1, multiFactor:1, allWeather:1 },
-  rsiPeriod:14, rsiOversold:35, rsiOverbought:65,
-  emaFast:9, emaSlow:21, bbPeriod:20, bbStdDev:2.0,
-  macdFast:12, macdSlow:26, riskReward:3,
-  maxTradeRisk:1.0, kellyFraction:50,
-  killSwitchThreshold:-20, maxPortfolioHeat:60, cashBuffer:20,
-  cryptoMax:100,
-  enabledAssets: Object.fromEntries(ALL_ASSETS.map(a => [a, true])),
-};
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+const ASSETS          = ['BTC', 'ETH'];
+const BINANCE_SYMBOLS = { BTC: 'BTCUSDT', ETH: 'ETHUSDT' };
+const PAPER_STAKE     = 100;                       // £100 per trade
+const MAX_HOLD_MS     = 10 * 24 * 60 * 60 * 1000; // 10 days
+const POLL_MS         = 5 * 60 * 1000;             // 5 minutes
+const INITIAL_CAPITAL = 1000;
+const PAPER_MODE      = process.env.PAPER_MODE !== 'false'; // default true
 
 // ─── PRICE DATA STORE ─────────────────────────────────────────────────────────
-const MAX_CANDLES = 300;
 const pd = {};
-for (const a of ALL_ASSETS) pd[a] = { closes:[], highs:[], lows:[], opens:[], volumes:[], timestamps:[] };
+for (const a of ASSETS)
+  pd[a] = { closes: [], highs: [], lows: [], opens: [], volumes: [], timestamps: [] };
 
 // ─── RUNTIME STATE ────────────────────────────────────────────────────────────
-let state       = null;
-let allTrades   = [];
-let learningData= [];
-let strategyWeights = {};
-let reports     = [];
-let config      = { ...DEFAULT_CONFIG };
+let state     = null;
+let allTrades = [];
 
-let lastRegimeUpdate     = 0;
-let lastLearningCycle    = 0;
-let lastMultiFactorReb   = 0;
-let lastAllWeatherReb    = 0;
-
-// ──────────────────────────────────────────────────────────────────────────────
-// HELPERS
-// ──────────────────────────────────────────────────────────────────────────────
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
 function log(msg)    { console.log(`[${new Date().toISOString()}] ${msg}`); }
-function uid()       { return Math.random().toString(36).slice(2,10); }
+function uid()       { return Math.random().toString(36).slice(2, 10); }
 function now()       { return new Date().toISOString(); }
-function loadJSON(f) { try { return JSON.parse(fs.readFileSync(f,'utf8')); } catch { return null; } }
-function saveJSON(f, d) { try { fs.writeFileSync(f, JSON.stringify(d,null,2)); } catch(e) { log(`Save error ${f}: ${e.message}`); } }
+function loadJSON(f) { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } }
+function saveJSON(f, d) { try { fs.writeFileSync(f, JSON.stringify(d, null, 2)); } catch(e) { log(`Save error ${f}: ${e.message}`); } }
 function delay(ms)   { return new Promise(r => setTimeout(r, ms)); }
-function clamp(v,mn,mx) { return Math.min(Math.max(v,mn),mx); }
 
 // ─── STATE INIT ───────────────────────────────────────────────────────────────
-function initState() {
-  const portfolios = {};
-  for (const [name, p] of Object.entries(PROFILES)) {
-    const perStrat = p.capital / 4;
-    portfolios[name] = {
-      nav: p.capital, cash: p.capital, positions: [],
-      peakNav: p.capital,
-      strategyStats: {
-        ptj:         { peakNav:perStrat, nav:perStrat, drawdown:0, suspended:false, suspendedAt:null, halfSize:false },
-        statArb:     { peakNav:perStrat, nav:perStrat, drawdown:0, suspended:false, suspendedAt:null, halfSize:false },
-        multiFactor: { peakNav:perStrat, nav:perStrat, drawdown:0, suspended:false, suspendedAt:null, halfSize:false },
-        allWeather:  { peakNav:perStrat, nav:perStrat, drawdown:0, suspended:false, suspendedAt:null, halfSize:false },
-      },
-    };
-  }
+function initPortfolios() {
   return {
-    portfolios,
-    regime: 'RISK_ON',
-    regimeReason: 'Initialising',
-    regimeChangedAt: now(),
-    killSwitch: { triggered:false, triggeredAt:null, reason:null },
-    allTimeHigh: 1000,
-    equityCurve: [],
-    lastUpdate: null,
-    livePrices: {},
+    paper: {
+      nav:      INITIAL_CAPITAL,
+      cash:     INITIAL_CAPITAL,
+      positions:[],
+      peakNav:  INITIAL_CAPITAL,
+      strategyStats: {
+        breakout:    { peakNav: INITIAL_CAPITAL / 2, nav: INITIAL_CAPITAL / 2, drawdown: 0, suspended: false, suspendedAt: null, halfSize: false },
+        emaPullback: { peakNav: INITIAL_CAPITAL / 2, nav: INITIAL_CAPITAL / 2, drawdown: 0, suspended: false, suspendedAt: null, halfSize: false },
+      },
+    },
   };
 }
 
-function initWeights() {
-  const w = {};
-  for (const profile of Object.keys(PROFILES))
-    for (const strat of ['ptj','statArb','multiFactor','allWeather'])
-      w[`${strat}_${profile}`] = 0.25;
-  return w;
+function initState() {
+  return {
+    portfolios:      initPortfolios(),
+    regime:          'RISK_ON',
+    regimeReason:    'Paper trading mode',
+    regimeChangedAt: now(),
+    killSwitch:      { triggered: false, triggeredAt: null, reason: null },
+    allTimeHigh:     INITIAL_CAPITAL,
+    equityCurve:     [],
+    lastUpdate:      null,
+    livePrices:      {},
+  };
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// HTTP UTILITIES
-// ──────────────────────────────────────────────────────────────────────────────
-function httpsGet(url, opts = {}) {
+// ─── HTTP UTILITIES ───────────────────────────────────────────────────────────
+function httpsGet(url) {
   return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const options = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      method: 'GET',
-      headers: { 'User-Agent': UA, 'Accept': 'application/json', ...opts.headers },
-    };
-    const req = https.request(options, res => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
-        try { resolve({ body: data, headers: res.headers, status: res.statusCode }); }
-        catch { resolve({ body: data, headers: res.headers, status: res.statusCode }); }
-      });
-    });
+    const u = new URL(url);
+    const req = https.request(
+      { hostname: u.hostname, path: u.pathname + u.search, method: 'GET', headers: { Accept: 'application/json' } },
+      res => {
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => {
+          if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}`));
+          resolve(data);
+        });
+      }
+    );
     req.on('error', reject);
     req.setTimeout(15000, () => { req.destroy(); reject(new Error('Timeout')); });
     req.end();
   });
 }
 
-async function httpsGetJSON(url, opts = {}) {
-  const { body } = await httpsGet(url, opts);
-  return JSON.parse(body);
+async function httpsGetJSON(url) {
+  return JSON.parse(await httpsGet(url));
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// DATA FETCHING — CoinGecko (crypto)
-// ──────────────────────────────────────────────────────────────────────────────
-
-// Copy candle array into the pd[asset] in-memory store
-function loadIntoPd(asset, candles) {
-  if (!candles?.length) return;
-  const d = pd[asset];
-  d.timestamps = candles.map(c => c.ts);
-  d.opens      = candles.map(c => c.open);
-  d.highs      = candles.map(c => c.high);
-  d.lows       = candles.map(c => c.low);
-  d.closes     = candles.map(c => c.close);
-  d.volumes    = candles.map(c => c.volume ?? 0);
-}
-
-// ─── COINGECKO: LIVE TICKER ───────────────────────────────────────────────────
-async function fetchCoinGeckoLive() {
+// ─── BINANCE DATA ─────────────────────────────────────────────────────────────
+async function fetchKlines(asset) {
+  const symbol = BINANCE_SYMBOLS[asset];
+  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=200`;
   try {
-    const ids = Object.values(CG_IDS).join(',');
-    const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${ids}&order=market_cap_desc&sparkline=false`;
-    const headers = {};
-    if (process.env.COINGECKO_API_KEY) headers['x-cg-demo-api-key'] = process.env.COINGECKO_API_KEY;
-    const data = await httpsGetJSON(url, { headers });
-    for (const item of data) {
-      const symbol = Object.keys(CG_IDS).find(k => CG_IDS[k] === item.id);
-      if (!symbol) continue;
-      state.livePrices[symbol] = {
-        price:     item.current_price,
-        change24h: item.price_change_percentage_24h || 0,
-        high24h:   item.high_24h,
-        low24h:    item.low_24h,
-        marketCap: item.market_cap,
-        volume24h: item.total_volume,
-      };
-    }
-    log(`[CG] Live prices updated for ${Object.keys(CG_IDS).join(',')}`);
-  } catch(e) { log(`[CG] Live fetch error: ${e.message}`); }
-}
+    const raw = await httpsGetJSON(url);
+    if (!Array.isArray(raw) || !raw.length) throw new Error('Empty response');
 
-// ─── COINGECKO: HISTORICAL PRICES (1-minute candles, last 24h) ───────────────
-async function fetchCGOHLC(asset) {
-  const id = CG_IDS[asset];
-  if (!id) return false;
-  try {
-    const headers = {};
-    if (process.env.COINGECKO_API_KEY) headers['x-cg-demo-api-key'] = process.env.COINGECKO_API_KEY;
-    const data = await httpsGetJSON(
-      `https://api.coingecko.com/api/v3/coins/${id}/market_chart?vs_currency=usd&days=1`,
-      { headers }
-    );
-    if (!Array.isArray(data?.prices) || data.prices.length === 0) throw new Error('Empty market_chart response');
-    const volMap = new Map((data.total_volumes || []).map(([ts, v]) => [ts, v]));
-    const candles = data.prices
-      .map(([ts, price]) => ({ ts, open:price, high:price, low:price, close:price, volume: volMap.get(ts) ?? 0 }))
-      .slice(-MAX_CANDLES);
-    loadIntoPd(asset, candles);
-    log(`[CG] ${asset} 1m: ${candles.length} candles loaded`);
+    const d = pd[asset];
+    d.timestamps = raw.map(c => c[0]);
+    d.opens      = raw.map(c => parseFloat(c[1]));
+    d.highs      = raw.map(c => parseFloat(c[2]));
+    d.lows       = raw.map(c => parseFloat(c[3]));
+    d.closes     = raw.map(c => parseFloat(c[4]));
+    d.volumes    = raw.map(c => parseFloat(c[5]));
+
+    const lastClose   = d.closes[d.closes.length - 1];
+    const close24hAgo = d.closes.length >= 25 ? d.closes[d.closes.length - 25] : d.closes[0];
+    const change24h   = close24hAgo > 0 ? ((lastClose - close24hAgo) / close24hAgo) * 100 : 0;
+
+    state.livePrices[asset] = { price: lastClose, change24h };
+    log(`[BINANCE] ${asset}: ${raw.length} candles, price=${lastClose.toFixed(2)}, 24h=${change24h.toFixed(2)}%`);
     return true;
   } catch(e) {
-    log(`[CG] ${asset} OHLC error: ${e.message}`);
+    log(`[BINANCE] ${asset} fetch error: ${e.message}`);
     return false;
   }
 }
 
 function getCurrentPrice(asset) {
-  return state.livePrices[asset]?.price || pd[asset].closes[pd[asset].closes.length - 1] || 0;
+  return state.livePrices[asset]?.price ?? pd[asset].closes[pd[asset].closes.length - 1] ?? 0;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// TECHNICAL INDICATORS
-// ──────────────────────────────────────────────────────────────────────────────
-function sma(arr, period) {
-  if (arr.length < period) return null;
-  const s = arr.slice(-period);
-  return s.reduce((a, b) => a + b, 0) / period;
-}
-
+// ─── INDICATORS ───────────────────────────────────────────────────────────────
 function emaFull(arr, period) {
   if (arr.length < period) return [];
   const k = 2 / (period + 1);
@@ -249,851 +147,210 @@ function emaFull(arr, period) {
   return result;
 }
 
-function ema(arr, period) {
+function emaLast(arr, period) {
   const full = emaFull(arr, period);
   return full.length ? full[full.length - 1] : null;
 }
 
-function rsi(closes, period = 14) {
-  if (closes.length < period + 1) return null;
-  const recent = closes.slice(-(period * 3 + 1));
-  let avgGain = 0, avgLoss = 0;
-  for (let i = 1; i <= period; i++) {
-    const diff = recent[i] - recent[i - 1];
-    if (diff > 0) avgGain += diff / period;
-    else avgLoss += (-diff) / period;
-  }
-  for (let i = period + 1; i < recent.length; i++) {
-    const diff = recent[i] - recent[i - 1];
-    avgGain = (avgGain * (period - 1) + Math.max(diff, 0)) / period;
-    avgLoss = (avgLoss * (period - 1) + Math.max(-diff, 0)) / period;
-  }
-  if (avgLoss === 0) return 100;
-  return 100 - 100 / (1 + avgGain / avgLoss);
-}
-
-function bollingerBands(closes, period = 20, stdDevMult = 2) {
-  if (closes.length < period) return null;
-  const s = closes.slice(-period);
-  const mid = s.reduce((a, b) => a + b, 0) / period;
-  const variance = s.reduce((a, b) => a + (b - mid) ** 2, 0) / period;
-  const std = Math.sqrt(variance);
-  return {
-    upper: mid + stdDevMult * std,
-    middle: mid,
-    lower: mid - stdDevMult * std,
-    bandwidth: std > 0 ? (stdDevMult * 2 * std) / mid : 0,
-    std,
-  };
-}
-
-function atr(highs, lows, closes, period = 14) {
-  const len = Math.min(highs.length, lows.length, closes.length);
-  if (len < period + 1) return null;
-  const h = highs.slice(-len), l = lows.slice(-len), c = closes.slice(-len);
-  const trs = [];
-  for (let i = 1; i < h.length; i++)
-    trs.push(Math.max(h[i] - l[i], Math.abs(h[i] - c[i-1]), Math.abs(l[i] - c[i-1])));
-  let atrVal = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < trs.length; i++)
-    atrVal = (atrVal * (period - 1) + trs[i]) / period;
-  return atrVal;
-}
-
-function adx(highs, lows, closes, period = 14) {
-  const len = Math.min(highs.length, lows.length, closes.length);
-  if (len < period * 3) return null;
-  const h = highs.slice(-len), l = lows.slice(-len), c = closes.slice(-len);
-  const trs=[], dmp=[], dmm=[];
-  for (let i = 1; i < h.length; i++) {
-    const up = h[i] - h[i-1], dn = l[i-1] - l[i];
-    dmp.push(up > dn && up > 0 ? up : 0);
-    dmm.push(dn > up && dn > 0 ? dn : 0);
-    trs.push(Math.max(h[i]-l[i], Math.abs(h[i]-c[i-1]), Math.abs(l[i]-c[i-1])));
-  }
-  let sTR = trs.slice(0,period).reduce((a,b)=>a+b,0);
-  let sDMP = dmp.slice(0,period).reduce((a,b)=>a+b,0);
-  let sDMM = dmm.slice(0,period).reduce((a,b)=>a+b,0);
-  const dxArr = [];
-  for (let i = period; i < trs.length; i++) {
-    sTR  = sTR  - sTR/period  + trs[i];
-    sDMP = sDMP - sDMP/period + dmp[i];
-    sDMM = sDMM - sDMM/period + dmm[i];
-    const diP = sTR>0 ? 100*sDMP/sTR : 0;
-    const diM = sTR>0 ? 100*sDMM/sTR : 0;
-    dxArr.push((diP+diM)>0 ? 100*Math.abs(diP-diM)/(diP+diM) : 0);
-  }
-  if (dxArr.length < period) return null;
-  let adxVal = dxArr.slice(0,period).reduce((a,b)=>a+b,0)/period;
-  for (let i = period; i < dxArr.length; i++) adxVal = (adxVal*(period-1)+dxArr[i])/period;
-  return adxVal;
-}
-
-function macd(closes, fast=12, slow=26, signal=9) {
-  if (closes.length < slow + signal) return null;
-  const fastEma = emaFull(closes, fast);
-  const slowEma = emaFull(closes, slow);
-  const len = Math.min(fastEma.length, slowEma.length);
-  const macdLine = [];
-  for (let i = 0; i < len; i++)
-    macdLine.push(fastEma[fastEma.length-len+i] - slowEma[slowEma.length-len+i]);
-  if (macdLine.length < signal) return null;
-  const sigEma = emaFull(macdLine, signal);
-  const sigVal = sigEma[sigEma.length-1];
-  const macdVal = macdLine[macdLine.length-1];
-  return { macd: macdVal, signal: sigVal, histogram: macdVal - sigVal };
-}
-
-function roc(closes, period=14) {
-  if (closes.length < period + 1) return null;
-  const prev = closes[closes.length - period - 1];
-  return prev ? ((closes[closes.length-1] - prev) / prev) * 100 : 0;
-}
-
-function zscore(series, period=20) {
-  if (series.length < period) return null;
-  const s = series.slice(-period);
-  const mean = s.reduce((a,b)=>a+b,0) / period;
-  const std  = Math.sqrt(s.reduce((a,b)=>a+(b-mean)**2,0) / period);
-  if (std === 0) return 0;
-  return (s[s.length-1] - mean) / std;
-}
-
-function rollingVolatility(closes, period=20) {
-  if (closes.length < period+1) return null;
-  const returns = [];
-  for (let i = closes.length-period; i < closes.length; i++)
-    returns.push(Math.log(closes[i] / closes[i-1]));
-  const mean = returns.reduce((a,b)=>a+b,0)/period;
-  const std  = Math.sqrt(returns.reduce((a,b)=>a+(b-mean)**2,0)/period);
-  return std * Math.sqrt(252 * 24); // annualised from hourly
-}
-
-// ─── BB SIGNAL HELPERS ────────────────────────────────────────────────────────
-function bbSignal(asset, cfg) {
+// ─── STRATEGY 1: BREAKOUT WITH VOLUME ────────────────────────────────────────
+// Entry: current candle closes above 20-period resistance AND volume > 1.5x 20-period avg
+// SL: 3% below entry  |  TP: 10% above entry  |  Max hold: 10 days
+function breakoutSignal(asset) {
   const d = pd[asset];
-  if (d.closes.length < cfg.bbPeriod) return { boost:0, position:'none' };
-  const bb = bollingerBands(d.closes, cfg.bbPeriod, cfg.bbStdDev);
-  const price = getCurrentPrice(asset);
-  const rsiVal = rsi(d.closes, cfg.rsiPeriod) || 50;
-  let boost = 0, position = 'middle';
+  if (d.closes.length < 22) return false;
 
-  // Squeeze
-  const isSqueeze = bb && bb.bandwidth < 0.10;
+  // 20 candles before current (exclude current candle)
+  const priorHighs   = d.highs.slice(-21, -1);
+  const priorVolumes = d.volumes.slice(-21, -1);
 
-  if (bb) {
-    if (price <= bb.lower) { position = 'lower'; if (rsiVal < cfg.rsiOversold) boost += 0.20; }
-    else if (price >= bb.upper) { position = 'upper'; if (rsiVal > cfg.rsiOverbought) boost -= 0.20; }
-    else if (price > bb.middle) position = 'above_mid';
-    else position = 'below_mid';
+  const resistance = Math.max(...priorHighs);
+  const avgVolume  = priorVolumes.reduce((a, b) => a + b, 0) / priorVolumes.length;
 
-    // Squeeze breakout
-    if (isSqueeze) {
-      if (price > bb.upper) boost += 0.10;
-      if (price < bb.lower) boost -= 0.10;
-    }
+  const currentClose  = d.closes[d.closes.length - 1];
+  const currentVolume = d.volumes[d.volumes.length - 1];
+
+  if (currentClose > resistance && currentVolume > 1.5 * avgVolume) {
+    log(`[BREAKOUT] ${asset}: close ${currentClose.toFixed(2)} > resistance ${resistance.toFixed(2)}, vol ${currentVolume.toFixed(0)} > 1.5x avg ${avgVolume.toFixed(0)}`);
+    return true;
   }
-  return { boost, position, bb, isSqueeze };
+  return false;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// STRATEGY 1 — PTJ TREND
-// ──────────────────────────────────────────────────────────────────────────────
-function ptjSignal(asset, cfg) {
+// ─── STRATEGY 2: EMA PULLBACK ─────────────────────────────────────────────────
+// Uptrend: price > 50 EMA AND 200 EMA
+// Entry: prev candle low ≤ 21 EMA AND current candle closes back above 21 EMA
+// SL: 50 EMA at entry  |  TP: 8% above entry  |  Max hold: 10 days
+function emaPullbackSignal(asset) {
   const d = pd[asset];
-  if (d.closes.length < 210) return 'HOLD'; // need ~200 candles for daily SMA
+  if (d.closes.length < 201) return null;
 
-  // Daily: every 24 hourly candles = 1 day
-  // Use all hourly closes as proxy (1h data, SMA200 = ~8 days in hourly candles)
-  // For proper daily SMA200, we'd need 200 daily candles = 4800 hourly
-  // We approximate: use available closes, SMA200 of hourly
-  const sma200  = sma(d.closes, 200);
-  const ema20   = ema(d.closes, 20);
-  const ema50   = ema(d.closes, 50);
-  const rsiVal  = rsi(d.closes, cfg.rsiPeriod);
+  const currentClose = d.closes[d.closes.length - 1];
+  const ema21        = emaLast(d.closes, 21);
+  const ema50        = emaLast(d.closes, 50);
+  const ema200       = emaLast(d.closes, 200);
 
-  const price   = getCurrentPrice(asset);
+  if (ema21 == null || ema50 == null || ema200 == null) return null;
 
-  if (!sma200 || !ema20 || !ema50 || rsiVal == null) return 'HOLD';
+  // Uptrend: price above both 50 EMA and 200 EMA
+  if (currentClose <= ema50 || currentClose <= ema200) return null;
 
-  const uptrend  = price > sma200;
-  const downtrend = price < sma200;
-  const bullMomentum = ema20 > ema50;
-  const bearMomentum = ema20 < ema50;
+  // 21 EMA value at the close of the previous candle
+  const prevCloses = d.closes.slice(0, -1);
+  const prevEma21  = emaLast(prevCloses, 21);
+  if (prevEma21 == null) return null;
 
-  // RSI crossing above 40 in uptrend
-  const rsiBuyEntry  = rsiVal < cfg.rsiOversold  && uptrend  && bullMomentum;
-  // RSI crossing below 60 in downtrend
-  const rsiShortEntry = rsiVal > cfg.rsiOverbought && downtrend;
+  const prevLow = d.lows[d.lows.length - 2];
 
-  const { boost } = bbSignal(asset, cfg);
-
-  if (rsiBuyEntry)  return boost >= 0 ? 'BUY'   : 'HOLD';
-  if (rsiShortEntry) return boost <= 0 ? 'SHORT' : 'HOLD';
-  return 'HOLD';
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// STRATEGY 2 — RENAISSANCE STAT-ARB
-// ──────────────────────────────────────────────────────────────────────────────
-function statArbSignals(cfg) {
-  const signals = [];
-  for (const [assetA, assetB] of PAIRS) {
-    const dA = pd[assetA], dB = pd[assetB];
-    const minLen = 25;
-    if (dA.closes.length < minLen || dB.closes.length < minLen) continue;
-
-    const len = Math.min(dA.closes.length, dB.closes.length, 100);
-    const spread = [];
-    for (let i = dA.closes.length - len; i < dA.closes.length; i++) {
-      const idxB = i - (dA.closes.length - dB.closes.length);
-      if (idxB >= 0 && idxB < dB.closes.length)
-        spread.push(dA.closes[i] / dB.closes[idxB]);
-    }
-
-    const z = zscore(spread, 20);
-    if (z == null) continue;
-
-    if (z > 0.8)  signals.push({ assetA, assetB, side:'A_SHORT_B_LONG',  zscore:z });
-    if (z < -0.8) signals.push({ assetA, assetB, side:'A_LONG_B_SHORT',  zscore:z });
-    if (Math.abs(z) < 0.3) signals.push({ assetA, assetB, side:'EXIT', zscore:z });
+  // Pullback: prev candle low touched or pierced the 21 EMA
+  // Bounce: current candle closes back above the 21 EMA
+  if (prevLow <= prevEma21 && currentClose > ema21) {
+    log(`[EMA_PULLBACK] ${asset}: prevLow ${prevLow.toFixed(2)} ≤ prevEMA21 ${prevEma21.toFixed(2)}, close ${currentClose.toFixed(2)} > EMA21 ${ema21.toFixed(2)}`);
+    return { ema50 };
   }
-  return signals;
+  return null;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// STRATEGY 3 — CITADEL MULTI-FACTOR
-// ──────────────────────────────────────────────────────────────────────────────
-function multiFactor_score(asset, cfg) {
-  const d = pd[asset];
-  if (d.closes.length < 50) return null;
-  const price = getCurrentPrice(asset);
-  const rsiVal = rsi(d.closes, cfg.rsiPeriod) || 50;
-  const rocVal = roc(d.closes, 14) || 0;
-  const atrVal = atr(d.highs, d.lows, d.closes, 14) || 1;
-  const adxVal = adx(d.highs, d.lows, d.closes, 14) || 0;
+// ─── POSITION MANAGEMENT ──────────────────────────────────────────────────────
+function openPosition(strategy, asset, stopLoss, takeProfit) {
+  const port = state.portfolios.paper;
 
-  const avgVol = d.volumes.length >= 20
-    ? d.volumes.slice(-20).reduce((a,b)=>a+b,0)/20 : 0;
-  const curVol = d.volumes[d.volumes.length-1] || 0;
+  // Max 1 open position per asset+strategy combination
+  if (port.positions.find(p => p.asset === asset && p.strategy === strategy)) return null;
 
-  // Factor 1: Momentum (0-20)
-  const momentumScore = clamp((rsiVal/100)*10 + clamp(rocVal/2,0,10), 0, 20);
-
-  // Factor 2: Volume (0-20)
-  const volScore = avgVol > 0 ? clamp((curVol/avgVol)*10, 0, 20) : 10;
-
-  // Factor 3: Volatility inverse (0-20) — low vol = high score
-  const normalAtr = price > 0 ? atrVal / price : 0;
-  const volAtility = clamp(20 - normalAtr * 2000, 0, 20);
-
-  // Factor 4: Trend Strength ADX (0-20)
-  const trendScore = clamp(adxVal / 5, 0, 20);
-
-  // Factor 5: Relative Strength (0-20)
-  const classAssets = CLASSES[ASSET_CLASS[asset]];
-  const classReturns = classAssets
-    .filter(a => pd[a].closes.length >= 24)
-    .map(a => { const c = pd[a].closes; return (c[c.length-1] - c[c.length-25]) / c[c.length-25] * 100; });
-  const avgClassReturn = classReturns.length ? classReturns.reduce((a,b)=>a+b,0)/classReturns.length : 0;
-  const myReturn = d.closes.length >= 24
-    ? (d.closes[d.closes.length-1] - d.closes[d.closes.length-25]) / d.closes[d.closes.length-25] * 100 : 0;
-  const relStr = clamp(10 + (myReturn - avgClassReturn) * 2, 0, 20);
-
-  const total = momentumScore + volScore + volAtility + trendScore + relStr;
-  return { total, momentumScore, volScore, volAtility, trendScore, relStr };
-}
-
-function multiFactorSignals(cfg) {
-  const signals = {};
-  for (const [cls, assets] of Object.entries(CLASSES)) {
-    const scored = [];
-    for (const asset of assets) {
-      const score = multiFactor_score(asset, cfg);
-      if (score !== null) scored.push({ asset, ...score });
-    }
-    scored.sort((a, b) => b.total - a.total);
-    const top3    = scored.slice(0, 3).map(s => ({ asset:s.asset, signal:'BUY',   score:s.total }));
-    const bottom3 = scored.slice(-3).map(s => ({ asset:s.asset, signal:'SHORT', score:s.total }));
-    for (const s of [...top3, ...bottom3]) signals[s.asset] = s;
-  }
-  return signals;
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// STRATEGY 4 — BRIDGEWATER ALL-WEATHER
-// ──────────────────────────────────────────────────────────────────────────────
-function allWeatherTargets(cfg, regime) {
-  let cryptoTarget = 0.90;
-  let cashTarget   = 0.10;
-
-  // Risk-Off: reduce exposure, hold more cash
-  if (regime === 'RISK_OFF')   { cryptoTarget -= 0.20; cashTarget += 0.20; }
-  // Stagflation: reduce crypto slightly
-  if (regime === 'STAGFLATION') { cryptoTarget -= 0.10; cashTarget += 0.10; }
-
-  const targets = {};
-  const vols = CLASSES.crypto.map(a => ({ asset:a, vol: rollingVolatility(pd[a].closes, 30) || 0.01 }));
-  const totalInvVol = vols.reduce((s, v) => s + 1/v.vol, 0);
-  for (const { asset, vol } of vols) {
-    targets[asset] = Math.min((1/vol / totalInvVol) * cryptoTarget, 0.30);
-  }
-  return targets;
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// MACRO REGIME DETECTION
-// ──────────────────────────────────────────────────────────────────────────────
-function detectRegime() {
-  const btcCloses = pd['BTC'].closes;
-  if (btcCloses.length < 50) return { regime: state.regime || 'RISK_ON', reason: 'Insufficient BTC data' };
-
-  const btcNow  = btcCloses[btcCloses.length - 1];
-  const sma50   = sma(btcCloses, 50);
-  const btcVol  = rollingVolatility(btcCloses, 20) || 0;
-  // Short-term momentum using available 1-min candles (up to 5h window)
-  const lookback = Math.min(btcCloses.length - 1, 240); // 240 min = 4h
-  const btcMom = lookback > 0
-    ? (btcNow - btcCloses[btcCloses.length - 1 - lookback]) / btcCloses[btcCloses.length - 1 - lookback] * 100
-    : 0;
-
-  const aboveSMA50 = sma50 && btcNow > sma50;
-  const annualVol  = btcVol;
-
-  let regime, reason;
-  if (!aboveSMA50 || annualVol > 0.40) {
-    regime = 'RISK_OFF';
-    reason = aboveSMA50 ? `BTC vol ${(annualVol*100).toFixed(1)}% > 40%` : 'BTC below 50-min SMA';
-  } else if (btcMom < -3) {
-    regime = 'STAGFLATION';
-    reason = `BTC 4h momentum ${btcMom.toFixed(1)}%`;
-  } else {
-    regime = 'RISK_ON';
-    reason = `BTC above 50-min SMA, vol ${(annualVol*100).toFixed(1)}%`;
-  }
-
-  if (regime !== state.regime) {
-    log(`[REGIME] Change: ${state.regime} → ${regime} — ${reason}`);
-    state.regimeChangedAt = now();
-  }
-  return { regime, reason };
-}
-
-
-// ──────────────────────────────────────────────────────────────────────────────
-// POSITION SIZING — KELLY CRITERION
-// ──────────────────────────────────────────────────────────────────────────────
-function kellyPositionSize(profile, strategy, asset, entryPrice, stopLoss) {
-  const prof  = PROFILES[profile];
-  const port  = state.portfolios[profile];
-  const cfg   = config;
-
-  // Kelly from trade history
-  const hist = allTrades.filter(t => t.profile === profile && t.strategy === strategy && t.asset === asset).slice(-20);
-  let kellyFrac = prof.kelly;
-  if (hist.length >= 5) {
-    const wins     = hist.filter(t => t.win);
-    const winRate  = wins.length / hist.length;
-    const avgWin   = wins.length > 0 ? wins.reduce((s,t) => s+t.pnlPct,0)/wins.length : prof.tp;
-    const losses   = hist.filter(t => !t.win);
-    const avgLoss  = losses.length > 0 ? losses.reduce((s,t) => s+Math.abs(t.pnlPct),0)/losses.length : prof.sl;
-    const rr       = avgLoss > 0 ? avgWin / avgLoss : 1;
-    const raw      = winRate - (1 - winRate) / rr;
-    kellyFrac = clamp(raw / 2, prof.kelly * 0.5, prof.kelly);
-  }
-  // Apply config override
-  kellyFrac = Math.min(kellyFrac, cfg.kellyFraction / 100);
-
-  const slPct  = entryPrice > 0 ? Math.abs(entryPrice - stopLoss) / entryPrice : prof.sl;
-  const maxRisk = (cfg.maxTradeRisk / 100) * port.nav;
-  const kellyRisk = kellyFrac * port.nav * slPct;
-  const riskAmount = Math.min(maxRisk, kellyRisk, prof.maxRisk * port.nav);
-
-  if (slPct === 0 || entryPrice === 0) return 0;
-  const qty = riskAmount / (entryPrice * slPct);
-  const notional = qty * entryPrice;
-
-  // Apply half-size if strategy in recovery
-  const stats = port.strategyStats[strategy];
-  const sizeMultiplier = (stats.halfSize || stats.suspended) ? 0.5 : 1;
-
-  // Apply regime reduction
-  let regimeMult = 1;
-  if (state.regime === 'RISK_OFF') regimeMult = 0.5;
-
-  return { qty: qty * sizeMultiplier * regimeMult, notional: notional * sizeMultiplier * regimeMult, riskAmount };
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// RISK LAYERS
-// ──────────────────────────────────────────────────────────────────────────────
-function layer1_checkTrade(profile, riskAmount) {
-  const port = state.portfolios[profile];
-  const maxAllowed = (config.maxTradeRisk / 100) * port.nav;
-  return riskAmount <= maxAllowed;
-}
-
-function layer2_checkStrategy(profile, strategy) {
-  const stats = state.portfolios[profile].strategyStats[strategy];
-  if (stats.suspended) {
-    // Auto-resume after 24h
-    if (stats.suspendedAt && Date.now() - new Date(stats.suspendedAt).getTime() > 86400000) {
-      stats.suspended = false;
-      stats.halfSize  = true;
-      log(`[RISK] ${strategy}/${profile} auto-resumed at half size`);
-    } else return false;
-  }
-  return true;
-}
-
-function layer3_checkAssetClass(profile, asset, notional) {
-  const port = state.portfolios[profile];
-  const cls  = ASSET_CLASS[asset];
-  const limits = { crypto: config.cryptoMax/100 };
-  const limit = limits[cls] || 1;
-
-  const classExposure = port.positions
-    .filter(p => ASSET_CLASS[p.asset] === cls)
-    .reduce((s, p) => s + p.notional, 0);
-
-  return (classExposure + notional) / port.nav <= limit;
-}
-
-function layer4_portfolioChecks() {
-  const totalNAV = Object.values(state.portfolios).reduce((s, p) => s + p.nav, 0);
-
-  // Kill switch
-  if (!state.killSwitch.triggered) {
-    if (totalNAV > state.allTimeHigh) state.allTimeHigh = totalNAV;
-    const drawdown = (totalNAV - state.allTimeHigh) / state.allTimeHigh * 100;
-    const threshold = config.killSwitchThreshold;
-    if (drawdown <= threshold) {
-      state.killSwitch.triggered  = true;
-      state.killSwitch.triggeredAt = now();
-      state.killSwitch.reason     = `Portfolio dropped ${drawdown.toFixed(2)}% from ATH £${state.allTimeHigh.toFixed(2)}`;
-      log(`[KILL SWITCH] TRIGGERED: ${state.killSwitch.reason}`);
-    }
-  }
-  return !state.killSwitch.triggered;
-}
-
-function portfolioHeat(profile) {
-  const port = state.portfolios[profile];
-  if (port.nav === 0) return 0;
-  const risk = port.positions.reduce((s, pos) => {
-    const cur = getCurrentPrice(pos.asset);
-    const slDiff = pos.side === 'LONG' ? pos.entryPrice - pos.stopLoss : pos.stopLoss - pos.entryPrice;
-    return s + pos.qty * Math.max(slDiff, 0);
-  }, 0);
-  return risk / port.nav;
-}
-
-function correlationRisk(profile) {
-  const positions = state.portfolios[profile].positions;
-  if (positions.length < 5) return false;
-  // Simplified: count positions in same direction per class
-  const longCount  = positions.filter(p => p.side === 'LONG').length;
-  const shortCount = positions.filter(p => p.side === 'SHORT').length;
-  return longCount >= 5 || shortCount >= 5;
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// TRADE EXECUTION
-// ──────────────────────────────────────────────────────────────────────────────
-function openPosition(profile, strategy, asset, side, cfg) {
-  if (!layer4_portfolioChecks()) return null;
-  if (!layer2_checkStrategy(profile, strategy)) return null;
-  if (!(config.enabledAssets?.[asset] !== false)) return null;
-  if ((config.capitalAllocation?.[profile]?.[strategy] ?? 100) === 0) return null;
-
-  const port  = state.portfolios[profile];
-  const prof  = PROFILES[profile];
   const price = getCurrentPrice(asset);
   if (!price) return null;
 
-  // Check for existing position on same asset+strategy
-  if (port.positions.find(p => p.asset === asset && p.strategy === strategy)) return null;
-
-  const sl = side === 'LONG'
-    ? price * (1 - prof.sl)
-    : price * (1 + prof.sl);
-  const tp = side === 'LONG'
-    ? price * (1 + prof.tp)
-    : price * (1 - prof.tp);
-
-  const sizing = kellyPositionSize(profile, strategy, asset, price, sl);
-  if (sizing.qty <= 0 || sizing.notional <= 0) return null;
-  if (!layer1_checkTrade(profile, sizing.riskAmount)) return null;
-  if (!layer3_checkAssetClass(profile, asset, sizing.notional)) return null;
-
-  // Check heat
-  const heat = portfolioHeat(profile);
-  if (heat >= config.maxPortfolioHeat / 100) {
-    log(`[RISK] ${profile} heat ${(heat*100).toFixed(1)}% at max, skipping ${asset}`);
-    return null;
-  }
-  // Correlation check
-  const corrHigh = correlationRisk(profile);
-  const finalQty = corrHigh ? sizing.qty * 0.5 : sizing.qty;
-  const finalNotional = finalQty * price;
-
-  if (port.cash < finalNotional * 0.1) return null; // need at least 10% cash margin
-
-  const rsiVal = rsi(pd[asset].closes, cfg.rsiPeriod);
-  const { position: bbPos } = bbSignal(asset, cfg);
-  const avgVol = pd[asset].volumes.length >= 20
-    ? pd[asset].volumes.slice(-20).reduce((a,b)=>a+b,0)/20 : 1;
-  const curVol = pd[asset].volumes[pd[asset].volumes.length-1] || 0;
+  const qty      = PAPER_STAKE / price;
+  const notional = PAPER_STAKE;
 
   const position = {
-    id:           uid(),
+    id:         uid(),
     strategy,
-    profile,
+    profile:    'paper',
     asset,
-    side,
-    entryPrice:   price,
-    qty:          finalQty,
-    notional:     finalNotional,
-    stopLoss:     sl,
-    takeProfit:   tp,
-    openedAt:     now(),
-    rsiAtEntry:   rsiVal,
-    trendAtEntry: price > (sma(pd[asset].closes, 200) || 0) ? 'up' : 'down',
-    bbPositionAtEntry: bbPos,
-    volumeAtEntry: avgVol > 0 ? curVol / avgVol : 1,
+    side:       'LONG',
+    entryPrice: price,
+    qty,
+    notional,
+    stopLoss,
+    takeProfit,
+    openedAt:   now(),
   };
 
   port.positions.push(position);
-  port.cash -= finalNotional * 0.1; // reserve 10% as margin
 
-  log(`[TRADE] OPEN ${side} ${asset} @${price.toFixed(4)} qty=${finalQty.toFixed(6)} strategy=${strategy} profile=${profile}`);
+  const tag = PAPER_MODE ? '[PAPER]' : '[TRADE]';
+  log(`${tag} OPEN LONG ${asset} @${price.toFixed(4)} notional=£${notional} strategy=${strategy} SL=${stopLoss.toFixed(4)} TP=${takeProfit.toFixed(4)}`);
   return position;
 }
 
-function closePosition(profile, posId, reason) {
-  const port = state.portfolios[profile];
+function closePosition(posId, reason) {
+  const port = state.portfolios.paper;
   const idx  = port.positions.findIndex(p => p.id === posId);
   if (idx === -1) return null;
   const pos  = port.positions[idx];
+
   const exitPrice = getCurrentPrice(pos.asset);
   if (!exitPrice) return null;
 
-  const pnl = pos.side === 'LONG'
-    ? (exitPrice - pos.entryPrice) * pos.qty
-    : (pos.entryPrice - exitPrice) * pos.qty;
-  const pnlPct = (pnl / pos.notional) * 100;
-  const win    = pnl >= 0;
-  const result = pnl > 0 ? 'WIN' : pnl < 0 ? 'LOSS' : 'BREAKEVEN';
+  const pnl      = (exitPrice - pos.entryPrice) * pos.qty;
+  const pnlPct   = (pnl / pos.notional) * 100;
+  const win      = pnl >= 0;
+  const result   = pnl > 0 ? 'WIN' : pnl < 0 ? 'LOSS' : 'BREAKEVEN';
+  const holdMins = (Date.now() - new Date(pos.openedAt).getTime()) / 60000;
 
-  const openedMs  = new Date(pos.openedAt).getTime();
-  const holdMins  = (Date.now() - openedMs) / 60000;
-
-  // Credit P&L to portfolio cash + return margin
-  port.cash += pos.notional * 0.1 + pnl;
   port.positions.splice(idx, 1);
 
   const closedTrade = {
     ...pos,
-    exitPrice, pnl: +pnl.toFixed(4), pnlPct: +pnlPct.toFixed(4),
-    win, result, exitReason: reason, closedAt: now(), holdDurationMinutes: +holdMins.toFixed(0),
+    exitPrice,
+    pnl:                 +pnl.toFixed(4),
+    pnlPct:              +pnlPct.toFixed(4),
+    win,
+    result,
+    exitReason:          reason,
+    closedAt:            now(),
+    holdDurationMinutes: +holdMins.toFixed(0),
   };
 
   allTrades.push(closedTrade);
-  learningData.push({
-    strategy: pos.strategy, profile, asset: pos.asset, assetClass: ASSET_CLASS[pos.asset],
-    entryPrice: pos.entryPrice, exitPrice, pnl: +pnl.toFixed(4), pnlPct: +pnlPct.toFixed(4),
-    win, rsiAtEntry: pos.rsiAtEntry, trendAtEntry: pos.trendAtEntry,
-    bbPositionAtEntry: pos.bbPositionAtEntry, volumeAtEntry: pos.volumeAtEntry,
-    holdDurationMinutes: +holdMins.toFixed(0), exitReason: reason,
-  });
 
-  log(`[TRADE] CLOSE ${pos.side} ${pos.asset} @${exitPrice.toFixed(4)} P&L=£${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%) reason=${reason}`);
+  const tag = PAPER_MODE ? '[PAPER]' : '[TRADE]';
+  log(`${tag} CLOSE LONG ${pos.asset} @${exitPrice.toFixed(4)} P&L=£${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%) reason=${reason}`);
   return closedTrade;
 }
 
-function checkPositionsSLTP(profile) {
-  const port  = state.portfolios[profile];
+// ─── CHECK STOPS AND MAX HOLD ─────────────────────────────────────────────────
+function checkPositions() {
+  const port    = state.portfolios.paper;
   const toClose = [];
 
   for (const pos of port.positions) {
     const price = getCurrentPrice(pos.asset);
     if (!price) continue;
 
-    if (pos.side === 'LONG') {
-      if (price <= pos.stopLoss) toClose.push({ id:pos.id, reason:'STOP_LOSS' });
-      else if (price >= pos.takeProfit) toClose.push({ id:pos.id, reason:'TAKE_PROFIT' });
-    } else {
-      if (price >= pos.stopLoss) toClose.push({ id:pos.id, reason:'STOP_LOSS' });
-      else if (price <= pos.takeProfit) toClose.push({ id:pos.id, reason:'TAKE_PROFIT' });
+    if (Date.now() - new Date(pos.openedAt).getTime() >= MAX_HOLD_MS) {
+      toClose.push({ id: pos.id, reason: 'MAX_HOLD' });
+    } else if (price <= pos.stopLoss) {
+      toClose.push({ id: pos.id, reason: 'STOP_LOSS' });
+    } else if (price >= pos.takeProfit) {
+      toClose.push({ id: pos.id, reason: 'TAKE_PROFIT' });
     }
   }
-  for (const { id, reason } of toClose) closePosition(profile, id, reason);
+
+  for (const { id, reason } of toClose) closePosition(id, reason);
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// NAV CALCULATION
-// ──────────────────────────────────────────────────────────────────────────────
-function updateNAV(profile) {
-  const port  = state.portfolios[profile];
+// ─── STRATEGY RUNNER ──────────────────────────────────────────────────────────
+function runStrategies() {
+  for (const asset of ASSETS) {
+    const price = getCurrentPrice(asset);
+    if (!price) continue;
+
+    // Strategy 1: Breakout with Volume
+    if (breakoutSignal(asset)) {
+      openPosition('breakout', asset, price * 0.97, price * 1.10);
+    }
+
+    // Strategy 2: EMA Pullback
+    const pullback = emaPullbackSignal(asset);
+    if (pullback) {
+      openPosition('emaPullback', asset, pullback.ema50, price * 1.08);
+    }
+  }
+}
+
+// ─── NAV ──────────────────────────────────────────────────────────────────────
+function updateNAV() {
+  const port = state.portfolios.paper;
   let unrealised = 0;
   for (const pos of port.positions) {
     const cur = getCurrentPrice(pos.asset);
-    if (!cur) continue;
-    const pnl = pos.side === 'LONG'
-      ? (cur - pos.entryPrice) * pos.qty
-      : (pos.entryPrice - cur) * pos.qty;
-    unrealised += pnl;
+    if (cur) unrealised += (cur - pos.entryPrice) * pos.qty;
   }
-  const closedPnl = allTrades
-    .filter(t => t.profile === profile)
-    .reduce((s, t) => s + t.pnl, 0);
-
-  port.nav = PROFILES[profile].capital + closedPnl + unrealised;
-  if (port.nav > port.peakNav) port.peakNav = port.nav;
-
-  // Update strategy drawdown stats
-  for (const [strat, stats] of Object.entries(port.strategyStats)) {
-    const stratPnl = allTrades
-      .filter(t => t.profile === profile && t.strategy === strat)
-      .reduce((s, t) => s + t.pnl, 0);
-    stats.nav = PROFILES[profile].capital / 4 + stratPnl;
-    if (stats.nav > stats.peakNav) stats.peakNav = stats.nav;
-    stats.drawdown = stats.peakNav > 0 ? (stats.nav - stats.peakNav) / stats.peakNav : 0;
-
-    // Layer 2: suspend on -15% strategy drawdown
-    if (!stats.suspended && stats.drawdown <= -0.15) {
-      stats.suspended = true;
-      stats.suspendedAt = now();
-      log(`[RISK] ${strat}/${profile} suspended: drawdown ${(stats.drawdown*100).toFixed(1)}%`);
-    }
-  }
+  const closedPnl = allTrades.reduce((s, t) => s + t.pnl, 0);
+  port.nav  = INITIAL_CAPITAL + closedPnl + unrealised;
+  port.cash = port.nav - port.positions.reduce((s, p) => s + p.notional, 0);
+  if (port.nav > port.peakNav)        port.peakNav        = port.nav;
+  if (port.nav > state.allTimeHigh)   state.allTimeHigh   = port.nav;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// SELF-LEARNING ENGINE
-// ──────────────────────────────────────────────────────────────────────────────
-function strategyMetrics(strategy, profile) {
-  const trades = allTrades.filter(t => t.strategy === strategy && t.profile === profile);
-  if (trades.length === 0) return { winRate:0.5, sharpe:0, maxDD:0, trades:0, pnl:0, profitFactor:1 };
-
-  const wins   = trades.filter(t => t.win);
-  const losses = trades.filter(t => !t.win);
-  const winRate = wins.length / trades.length;
-  const avgWin  = wins.length   ? wins.reduce((s,t)=>s+t.pnlPct,0)/wins.length     : 0;
-  const avgLoss = losses.length ? losses.reduce((s,t)=>s+Math.abs(t.pnlPct),0)/losses.length : 0;
-  const profitFactor = avgLoss > 0 ? (winRate*avgWin)/((1-winRate)*avgLoss) : 0;
-
-  const returns = trades.map(t => t.pnlPct);
-  const mean    = returns.reduce((a,b)=>a+b,0)/returns.length;
-  const std     = returns.length>1 ? Math.sqrt(returns.reduce((a,b)=>a+(b-mean)**2,0)/returns.length) : 0;
-  const sharpe  = std>0 ? (mean/std)*Math.sqrt(252) : 0;
-
-  let peak=0, maxDD=0, run=0;
-  for (const t of trades) {
-    run += t.pnl;
-    if (run > peak) peak = run;
-    maxDD = Math.max(maxDD, peak - run);
-  }
-  return { winRate, sharpe, maxDD, trades:trades.length, pnl:trades.reduce((s,t)=>s+t.pnl,0), profitFactor };
-}
-
-function runLearningCycle() {
-  log('[LEARNING] Running daily learning cycle...');
-  const combos = [];
-  for (const profile of Object.keys(PROFILES))
-    for (const strategy of ['ptj','statArb','multiFactor','allWeather'])
-      combos.push({ key:`${strategy}_${profile}`, strategy, profile, ...strategyMetrics(strategy, profile) });
-
-  combos.sort((a, b) => b.sharpe - a.sharpe);
-
-  // Adjust weights
-  const newWeights = { ...strategyWeights };
-  for (let i = 0; i < Math.min(3, combos.length); i++)
-    newWeights[combos[i].key] = Math.min(0.40, (newWeights[combos[i].key] || 0.25) + 0.05);
-  for (let i = Math.max(0, combos.length-3); i < combos.length; i++)
-    newWeights[combos[i].key] = Math.max(0.05, (newWeights[combos[i].key] || 0.25) - 0.05);
-
-  // Normalise per profile
-  for (const profile of Object.keys(PROFILES)) {
-    const keys   = ['ptj','statArb','multiFactor','allWeather'].map(s => `${s}_${profile}`);
-    const total  = keys.reduce((s, k) => s + (newWeights[k] || 0.25), 0);
-    for (const k of keys) newWeights[k] = (newWeights[k] || 0.25) / total;
-  }
-
-  strategyWeights = newWeights;
-  saveJSON(F.weights, strategyWeights);
-
-  const report = {
-    generatedAt: now(),
-    bestCombo:  combos[0],
-    worstCombo: combos[combos.length-1],
-    allCombos:  combos,
-    regimePerformance: state.regime,
-  };
-  reports.unshift(report);
-  if (reports.length > 30) reports = reports.slice(0, 30);
-  saveJSON(F.reports, reports);
-  saveJSON(F.learning, learningData);
-  log(`[LEARNING] Best: ${combos[0]?.key} Sharpe=${combos[0]?.sharpe.toFixed(2)}`);
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// MAIN STRATEGY EXECUTION
-// ──────────────────────────────────────────────────────────────────────────────
-function runPTJ(cfg) {
-  for (const profile of Object.keys(PROFILES)) {
-    const port = state.portfolios[profile];
-    for (const asset of ALL_ASSETS) {
-      if (!config.enabledAssets?.[asset]) continue;
-      const signal = ptjSignal(asset, cfg);
-      const boost  = bbSignal(asset, cfg).boost;
-
-      if (signal === 'BUY' || (signal === 'HOLD' && boost > 0.3)) {
-        // Check if already long
-        if (!port.positions.find(p => p.asset === asset && p.strategy === 'ptj' && p.side === 'LONG'))
-          openPosition(profile, 'ptj', asset, 'LONG', cfg);
-        // Close any existing short
-        const shortPos = port.positions.find(p => p.asset === asset && p.strategy === 'ptj' && p.side === 'SHORT');
-        if (shortPos) closePosition(profile, shortPos.id, 'SIGNAL_REVERSAL');
-      } else if (signal === 'SHORT' || (signal === 'HOLD' && boost < -0.3)) {
-        if (!port.positions.find(p => p.asset === asset && p.strategy === 'ptj' && p.side === 'SHORT'))
-          openPosition(profile, 'ptj', asset, 'SHORT', cfg);
-        const longPos = port.positions.find(p => p.asset === asset && p.strategy === 'ptj' && p.side === 'LONG');
-        if (longPos) closePosition(profile, longPos.id, 'SIGNAL_REVERSAL');
-      }
-    }
-  }
-}
-
-function runStatArb(cfg) {
-  const signals = statArbSignals(cfg);
-  for (const profile of Object.keys(PROFILES)) {
-    const port = state.portfolios[profile];
-
-    for (const sig of signals) {
-      const pairKey = `${sig.assetA}_${sig.assetB}`;
-
-      if (sig.side === 'EXIT') {
-        // Close both legs
-        const toClose = port.positions.filter(p => p.pairKey === pairKey && p.strategy === 'statArb');
-        for (const p of toClose) closePosition(profile, p.id, 'ZSCORE_MEAN_REVERT');
-        continue;
-      }
-
-      // Already have this pair open?
-      if (port.positions.find(p => p.pairKey === pairKey && p.strategy === 'statArb')) continue;
-
-      const sideA = sig.side === 'A_SHORT_B_LONG' ? 'SHORT' : 'LONG';
-      const sideB = sig.side === 'A_SHORT_B_LONG' ? 'LONG'  : 'SHORT';
-
-      const posA = openPosition(profile, 'statArb', sig.assetA, sideA, cfg);
-      const posB = openPosition(profile, 'statArb', sig.assetB, sideB, cfg);
-      if (posA) posA.pairKey = pairKey;
-      if (posB) posB.pairKey = pairKey;
-    }
-  }
-}
-
-function runMultiFactor(cfg) {
-  const now4h = Date.now() - lastMultiFactorReb > 4 * 3600 * 1000;
-  if (!now4h) return;
-  lastMultiFactorReb = Date.now();
-
-  const signals = multiFactorSignals(cfg);
-
-  for (const profile of Object.keys(PROFILES)) {
-    const port = state.portfolios[profile];
-    // Close all existing multi-factor positions
-    const existing = port.positions.filter(p => p.strategy === 'multiFactor').map(p => p.id);
-    for (const id of existing) closePosition(profile, id, 'REBALANCE');
-
-    // Open new positions
-    for (const [asset, sig] of Object.entries(signals)) {
-      if (!config.enabledAssets?.[asset]) continue;
-      openPosition(profile, 'multiFactor', asset, sig.signal === 'BUY' ? 'LONG' : 'SHORT', cfg);
-    }
-  }
-}
-
-function runAllWeather(cfg) {
-  const now7d = Date.now() - lastAllWeatherReb > 7 * 24 * 3600 * 1000;
-  if (!now7d && !checkAllWeatherDrift()) return;
-  lastAllWeatherReb = Date.now();
-
-  const targets = allWeatherTargets(cfg, state.regime);
-  for (const profile of Object.keys(PROFILES)) {
-    const port = state.portfolios[profile];
-    // Close all All-Weather positions
-    const existing = port.positions.filter(p => p.strategy === 'allWeather').map(p => p.id);
-    for (const id of existing) closePosition(profile, id, 'REBALANCE');
-
-    // Open new positions proportional to target weights
-    for (const [asset, targetWeight] of Object.entries(targets)) {
-      if (targetWeight < 0.01) continue;
-      if (!config.enabledAssets?.[asset]) continue;
-      openPosition(profile, 'allWeather', asset, 'LONG', cfg);
-    }
-  }
-}
-
-function checkAllWeatherDrift() {
-  // Check if any asset has drifted > 5% from target
-  const targets = allWeatherTargets(config, state.regime);
-  for (const profile of Object.keys(PROFILES)) {
-    const port = state.portfolios[profile];
-    for (const [asset, target] of Object.entries(targets)) {
-      const pos = port.positions.find(p => p.asset === asset && p.strategy === 'allWeather');
-      const actual = pos ? pos.notional / port.nav : 0;
-      if (Math.abs(actual - target) > 0.05) return true;
-    }
-  }
-  return false;
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// EQUITY CURVE
-// ──────────────────────────────────────────────────────────────────────────────
 function recordEquityCurve() {
-  const navs = {};
-  let total = 0;
-  for (const profile of Object.keys(PROFILES)) {
-    navs[profile] = state.portfolios[profile].nav;
-    total += navs[profile];
-  }
-  const point = { timestamp: now(), ...navs, total };
-  state.equityCurve.push(point);
+  const nav = state.portfolios.paper.nav;
+  state.equityCurve.push({ timestamp: now(), paper: nav, total: nav });
   if (state.equityCurve.length > 500) state.equityCurve = state.equityCurve.slice(-500);
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// MAIN TICK
-// ──────────────────────────────────────────────────────────────────────────────
+// ─── MAIN TICK ────────────────────────────────────────────────────────────────
 async function tick() {
-  // Reload config on every tick (so DJ console changes apply immediately)
-  const freshConfig = loadJSON(F.config);
-  if (freshConfig) config = { ...DEFAULT_CONFIG, ...freshConfig };
-
-  if (state.killSwitch.triggered) {
-    log('[APEX] Kill switch triggered — trading halted');
-    saveJSON(F.state, state);
-    return;
+  for (const asset of ASSETS) {
+    await fetchKlines(asset);
+    await delay(300);
   }
 
-  const cfg = config;
-
-  // Check SL/TP on all open positions
-  for (const profile of Object.keys(PROFILES)) checkPositionsSLTP(profile);
-
-  // Run strategies (pass config)
-  if (cfg.strategyWeights?.ptj > 0)         runPTJ(cfg);
-  if (cfg.strategyWeights?.statArb > 0)     runStatArb(cfg);
-  if (cfg.strategyWeights?.multiFactor > 0) runMultiFactor(cfg);
-  if (cfg.strategyWeights?.allWeather > 0)  runAllWeather(cfg);
-
-  // Update NAV for all portfolios
-  for (const profile of Object.keys(PROFILES)) updateNAV(profile);
-
-  // Record equity curve point
+  checkPositions();
+  runStrategies();
+  updateNAV();
   recordEquityCurve();
 
   state.lastUpdate = now();
@@ -1101,100 +358,44 @@ async function tick() {
   saveJSON(F.trades, allTrades.slice(-1000));
   saveJSON(F.priceHistory, pd);
 
-  // Log summary
-  const total = Object.values(state.portfolios).reduce((s, p) => s + p.nav, 0);
-  const openCount = Object.values(state.portfolios).reduce((s, p) => s + p.positions.length, 0);
-  log(`[APEX] NAV=£${total.toFixed(2)} | Open=${openCount} | Regime=${state.regime}`);
+  const port = state.portfolios.paper;
+  log(`[BOT] NAV=£${port.nav.toFixed(2)} | Open=${port.positions.length} | Trades=${allTrades.length}`);
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// STARTUP
-// ──────────────────────────────────────────────────────────────────────────────
+// ─── STARTUP ──────────────────────────────────────────────────────────────────
 async function start() {
   log('═══════════════════════════════════════════════════');
-  log('      APEX BOT — Starting up...');
+  log('      SWING BOT — Breakout + EMA Pullback');
+  log(`      PAPER_MODE=${PAPER_MODE} | STAKE=£${PAPER_STAKE}`);
   log('═══════════════════════════════════════════════════');
 
-  // Load persisted state
-  state           = loadJSON(F.state) || initState();
-  allTrades       = loadJSON(F.trades) || [];
-  learningData    = loadJSON(F.learning) || [];
-  strategyWeights = loadJSON(F.weights) || initWeights();
-  reports         = loadJSON(F.reports) || [];
-  config          = { ...DEFAULT_CONFIG, ...(loadJSON(F.config) || {}) };
+  state     = loadJSON(F.state) || initState();
+  allTrades = loadJSON(F.trades) || [];
 
-  // Write default config if none exists
-  if (!loadJSON(F.config)) saveJSON(F.config, DEFAULT_CONFIG);
-
-  // Restore price history from previous run (survives Railway restarts)
-  const savedPd = loadJSON(F.priceHistory);
-  if (savedPd) {
-    for (const asset of ALL_ASSETS) {
-      if (savedPd[asset]?.closes?.length) pd[asset] = savedPd[asset];
-    }
-    log('[APEX] Price history restored from disk');
+  // Migrate old multi-profile state to new single paper portfolio
+  if (!state.portfolios?.paper) {
+    log('[BOT] New portfolio structure — resetting portfolios');
+    state.portfolios  = initPortfolios();
+    state.allTimeHigh = INITIAL_CAPITAL;
+    state.equityCurve = [];
   }
 
-  // Initial data load
-  log('[APEX] Loading crypto OHLC from CoinGecko...');
-  await fetchCoinGeckoLive();
-  for (const asset of CLASSES.crypto) { await fetchCGOHLC(asset); await delay(8000); }
+  const savedPd = loadJSON(F.priceHistory);
+  if (savedPd) {
+    for (const asset of ASSETS) {
+      if (savedPd[asset]?.closes?.length) pd[asset] = savedPd[asset];
+    }
+    log('[BOT] Price history restored from disk');
+  }
 
-  // Initial regime detection
-  const regimeResult = detectRegime();
-  state.regime = regimeResult.regime;
-  state.regimeReason = regimeResult.reason;
-  lastRegimeUpdate = Date.now();
-
-  // Run backtest on startup
-  try {
-    const { runBacktest } = require('./backtest');
-    log('[APEX] Running startup backtest...');
-    await runBacktest();
-    log('[APEX] Backtest complete');
-  } catch(e) { log(`[APEX] Backtest skipped: ${e.message}`); }
-
-  // Run first tick
   await tick();
 
-  // ─── SCHEDULERS ───────────────────────────────────────────────────────────
-
-  // Crypto: CoinGecko live prices every 60 seconds + OHLC every 5 minutes
   setInterval(async () => {
-    try { await fetchCoinGeckoLive(); await tick(); }
-    catch(e) { log(`[LOOP] CG live tick error: ${e.message}`); }
-  }, 60_000);
+    try { await tick(); }
+    catch(e) { log(`[LOOP] Error: ${e.message}`); }
+  }, POLL_MS);
 
-  setInterval(async () => {
-    try {
-      for (const asset of CLASSES.crypto) { await fetchCGOHLC(asset); await delay(8000); }
-      await tick();
-    } catch(e) { log(`[LOOP] CG OHLC tick error: ${e.message}`); }
-  }, 6 * 60_000);
-
-  // Regime: every 4 hours
-  setInterval(() => {
-    try {
-      const r = detectRegime();
-      state.regime = r.regime;
-      state.regimeReason = r.reason;
-    } catch(e) { log(`[REGIME] Error: ${e.message}`); }
-  }, 4 * 3600_000);
-
-  // Learning cycle: every 24 hours
-  setInterval(() => {
-    try { runLearningCycle(); } catch(e) { log(`[LEARN] Error: ${e.message}`); }
-  }, 24 * 3600_000);
-
-  // Weekly backtest
-  setInterval(async () => {
-    try {
-      const { runBacktest } = require('./backtest');
-      await runBacktest();
-    } catch(e) { log(`[BACKTEST] Weekly error: ${e.message}`); }
-  }, 7 * 24 * 3600_000);
-
-  log('[APEX] All schedulers running. Bot is live.');
+  log('[BOT] Running. Polling Binance every 5 minutes.');
 }
 
-start().catch(e => { console.error('[APEX] Fatal startup error:', e); process.exit(1); });
+start().catch(e => { console.error('[BOT] Fatal startup error:', e); process.exit(1); });
