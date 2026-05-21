@@ -290,6 +290,8 @@ app.get('/api/forecast', async (req, res) => {
         if (!isNaN(strike) && o.delta != null) chain[strike] = o.delta;
       }
       const chainStrikes = Object.keys(chain).map(Number).sort((a, b) => a - b);
+      console.log(`[FORECAST] Selected expiry: ${new Date(bestExpiry).toDateString()} with ${chainStrikes.length} strikes`);
+      console.log(`[FORECAST] Strike range: ${chainStrikes[0]} – ${chainStrikes[chainStrikes.length - 1]}`);
       if (!chainStrikes.length) throw new Error('Empty chain for chosen expiry');
 
       // Resolve delta: exact match, then interpolate within ±5000 of target
