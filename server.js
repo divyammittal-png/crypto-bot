@@ -232,16 +232,8 @@ app.get('/api/forecast', async (req, res) => {
   try {
     const state = loadJSON(F.state) || {};
     const S = state.livePrices?.BTC?.price || 0;
+    const impliedVol = state.impliedVol || 0.70;
 
-    // DVOL for cone bands
-    let impliedVol = state.impliedVol || 0.70;
-    try {
-      const dv = await deribitPost('public/get_volatility_index_data', { currency_pair: 'btc_usd', resolution: '3600', count: 1 });
-      const entry = dv?.data?.[0];
-      if (entry) impliedVol = (entry[4] != null ? entry[4] : entry[1]) / 100;
-    } catch(_) { /* use stored/fallback value */ }
-
-    // Price history
     const ph = loadJSON(dataPath('price-history.json')) || {};
     const closes = ph.BTC?.closes || [];
     const histLen = Math.min(closes.length, 48);
@@ -250,81 +242,17 @@ app.get('/api/forecast', async (req, res) => {
       p,
     }));
 
+    const T = 30 / 365;
     const targets = [70000, 75000, 80000, 85000, 90000, 95000];
-    let probabilityLevels;
-    let source = 'log-normal-fallback';
+    const probabilityLevels = targets.map(K => ({
+      price: K,
+      probability: S > 0 ? +normCDF(Math.log(K / S) / (impliedVol * Math.sqrt(T))).toFixed(4) : 0,
+    }));
 
-    try {
-      // Fetch full BTC options book from Deribit
-      const options = await deribitPost('public/get_book_summary_by_currency', { currency: 'BTC', kind: 'option' });
-      if (!Array.isArray(options)) throw new Error('Unexpected options response');
+    const upperBand = Array.from({ length: 30 }, (_, i) => S * Math.exp(impliedVol * Math.sqrt((i + 1) / 365)));
+    const lowerBand = Array.from({ length: 30 }, (_, i) => S * Math.exp(-impliedVol * Math.sqrt((i + 1) / 365)));
 
-      // Filter calls only
-      const calls = options.filter(o => o.instrument_name?.endsWith('-C'));
-      if (!calls.length) throw new Error('No call options returned');
-
-      // Parse expiry date from name like "BTC-25MAY26-74000-C" (DDMMMYY, two-digit year)
-      const MONTHS = { JAN:0, FEB:1, MAR:2, APR:3, MAY:4, JUN:5, JUL:6, AUG:7, SEP:8, OCT:9, NOV:10, DEC:11 };
-      function parseExpiry(name) {
-        const s = name.split('-')[1]; // "25MAY26"
-        if (!s || s.length < 7) return null;
-        const day = parseInt(s.slice(0, 2));
-        const mon = MONTHS[s.slice(2, 5)];
-        const yr  = 2000 + parseInt(s.slice(5)); // "26" → 2026
-        return (isNaN(day) || mon === undefined || isNaN(yr)) ? null : new Date(yr, mon, day).getTime();
-      }
-
-      // Exclude expiries < 7 days out; from the rest pick closest to 30 days
-      const now7  = Date.now() + 7  * 24 * 60 * 60 * 1000;
-      const now30 = Date.now() + 30 * 24 * 60 * 60 * 1000;
-      const expiries = [...new Set(calls.map(o => parseExpiry(o.instrument_name)).filter(Boolean))]
-        .filter(e => e >= now7);
-      if (!expiries.length) throw new Error('Could not parse any expiries');
-      const bestExpiry = expiries.reduce((a, b) => Math.abs(a - now30) <= Math.abs(b - now30) ? a : b);
-
-      // Build strike→delta map for the chosen expiry
-      const chain = {};
-      for (const o of calls) {
-        if (parseExpiry(o.instrument_name) !== bestExpiry) continue;
-        const strike = parseInt(o.instrument_name.split('-')[2]);
-        if (!isNaN(strike) && o.delta != null) chain[strike] = o.delta;
-      }
-      const chainStrikes = Object.keys(chain).map(Number).sort((a, b) => a - b);
-      console.log(`[FORECAST] Selected expiry: ${new Date(bestExpiry).toDateString()} with ${chainStrikes.length} strikes`);
-      console.log(`[FORECAST] Strike range: ${chainStrikes[0]} – ${chainStrikes[chainStrikes.length - 1]}`);
-      if (!chainStrikes.length) throw new Error('Empty chain for chosen expiry');
-
-      // Resolve delta: exact match, then interpolate within ±5000 of target
-      probabilityLevels = targets.map(K => {
-        if (chain[K] !== undefined) return { price: K, probability: chain[K] };
-        const below = chainStrikes.filter(s => s >= K - 5000 && s < K);
-        const above = chainStrikes.filter(s => s > K && s <= K + 5000);
-        if (!below.length && !above.length) return { price: K, probability: null };
-        if (!below.length) return { price: K, probability: chain[above[0]] };
-        if (!above.length) return { price: K, probability: chain[below[below.length - 1]] };
-        const lo = below[below.length - 1], hi = above[0];
-        const t = (K - lo) / (hi - lo);
-        return { price: K, probability: +(chain[lo] + t * (chain[hi] - chain[lo])).toFixed(4) };
-      });
-
-      source = 'deribit-options';
-    } catch(e) {
-      console.error('[FORECAST] Deribit options fetch failed —', e.message,
-        e.statusCode ? `status=${e.statusCode}` : '',
-        e.body       ? `body=${String(e.body).slice(0, 500)}` : '');
-      // Fallback: log-normal model
-      const T = 30 / 365;
-      probabilityLevels = targets.map(K => ({
-        price: K,
-        probability: S > 0 ? +normCDF(Math.log(K / S) / (impliedVol * Math.sqrt(T))).toFixed(4) : 0,
-      }));
-    }
-
-    const sigma = impliedVol;
-    const upperBand = Array.from({ length: 30 }, (_, i) => S * Math.exp(sigma * Math.sqrt((i + 1) / 365)));
-    const lowerBand = Array.from({ length: 30 }, (_, i) => S * Math.exp(-sigma * Math.sqrt((i + 1) / 365)));
-
-    res.json({ currentPrice: S, impliedVol, probabilityLevels, priceHistory, upperBand, lowerBand, source });
+    res.json({ currentPrice: S, impliedVol, probabilityLevels, priceHistory, upperBand, lowerBand, source: 'dvol-lognormal' });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
@@ -1372,12 +1300,12 @@ async function loadForecast() {
       },
     });
 
-    const srcLabel = data.source === 'deribit-options' ? 'Delta (mkt-implied prob)' : 'Log-normal model';
+    const srcLabel = `DVOL log-normal  ${(data.impliedVol * 100).toFixed(1)}% ann.`;
     document.getElementById('forecast-meta').innerHTML =
       \`<span>Current price: <strong>$\${currentPrice.toFixed(0)}</strong></span>\` +
       \`<span>Deribit DVOL: <strong>\${ivPct}% ann.</strong></span>\` +
       \`<span>Cone = ±1σ over 30 days</span>\` +
-      \`<span style="color:var(--blue);font-weight:600">\${srcLabel}</span> \` +
+      \`<span style="color:var(--green);font-weight:600">\${srcLabel}</span> \` +
       probabilityLevels.map(l =>
         \`<span>$\${(l.price/1000).toFixed(0)}k: <strong>\${(l.probability*100).toFixed(1)}%</strong></span>\`
       ).join('');
