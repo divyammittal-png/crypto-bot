@@ -21,7 +21,7 @@ const F = {
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 const ASSETS          = ['BTC', 'ETH'];
-const BINANCE_SYMBOLS = { BTC: 'BTCUSDT', ETH: 'ETHUSDT' };
+const CG_IDS          = { BTC: 'bitcoin', ETH: 'ethereum' };
 const PAPER_STAKE     = 100;                       // £100 per trade
 const MAX_HOLD_MS     = 10 * 24 * 60 * 60 * 1000; // 10 days
 const POLL_MS         = 5 * 60 * 1000;             // 5 minutes
@@ -76,11 +76,11 @@ function initState() {
 }
 
 // ─── HTTP UTILITIES ───────────────────────────────────────────────────────────
-function httpsGet(url) {
+function httpsGet(url, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const req = https.request(
-      { hostname: u.hostname, path: u.pathname + u.search, method: 'GET', headers: { Accept: 'application/json' } },
+      { hostname: u.hostname, path: u.pathname + u.search, method: 'GET', headers: { Accept: 'application/json', ...extraHeaders } },
       res => {
         let data = '';
         res.on('data', c => data += c);
@@ -96,35 +96,38 @@ function httpsGet(url) {
   });
 }
 
-async function httpsGetJSON(url) {
-  return JSON.parse(await httpsGet(url));
+async function httpsGetJSON(url, extraHeaders = {}) {
+  return JSON.parse(await httpsGet(url, extraHeaders));
 }
 
-// ─── BINANCE DATA ─────────────────────────────────────────────────────────────
+// ─── COINGECKO DATA ───────────────────────────────────────────────────────────
 async function fetchKlines(asset) {
-  const symbol = BINANCE_SYMBOLS[asset];
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=200`;
+  const id  = CG_IDS[asset];
+  const url = `https://api.coingecko.com/api/v3/coins/${id}/ohlc?vs_currency=usd&days=90`;
+  const headers = process.env.COINGECKO_API_KEY
+    ? { 'x-cg-demo-api-key': process.env.COINGECKO_API_KEY }
+    : {};
   try {
-    const raw = await httpsGetJSON(url);
+    const raw = await httpsGetJSON(url, headers);
     if (!Array.isArray(raw) || !raw.length) throw new Error('Empty response');
 
     const d = pd[asset];
     d.timestamps = raw.map(c => c[0]);
-    d.opens      = raw.map(c => parseFloat(c[1]));
-    d.highs      = raw.map(c => parseFloat(c[2]));
-    d.lows       = raw.map(c => parseFloat(c[3]));
-    d.closes     = raw.map(c => parseFloat(c[4]));
-    d.volumes    = raw.map(c => parseFloat(c[5]));
+    d.opens      = raw.map(c => c[1]);
+    d.highs      = raw.map(c => c[2]);
+    d.lows       = raw.map(c => c[3]);
+    d.closes     = raw.map(c => c[4]);
+    // CoinGecko OHLC does not include volume
 
     const lastClose   = d.closes[d.closes.length - 1];
     const close24hAgo = d.closes.length >= 25 ? d.closes[d.closes.length - 25] : d.closes[0];
     const change24h   = close24hAgo > 0 ? ((lastClose - close24hAgo) / close24hAgo) * 100 : 0;
 
     state.livePrices[asset] = { price: lastClose, change24h };
-    log(`[BINANCE] ${asset}: ${raw.length} candles, price=${lastClose.toFixed(2)}, 24h=${change24h.toFixed(2)}%`);
+    log(`[CG] ${asset}: ${raw.length} candles, price=${lastClose.toFixed(2)}, 24h=${change24h.toFixed(2)}%`);
     return true;
   } catch(e) {
-    log(`[BINANCE] ${asset} fetch error: ${e.message}`);
+    log(`[CG] ${asset} fetch error: ${e.message}`);
     return false;
   }
 }
@@ -152,25 +155,20 @@ function emaLast(arr, period) {
   return full.length ? full[full.length - 1] : null;
 }
 
-// ─── STRATEGY 1: BREAKOUT WITH VOLUME ────────────────────────────────────────
-// Entry: current candle closes above 20-period resistance AND volume > 1.5x 20-period avg
+// ─── STRATEGY 1: BREAKOUT ────────────────────────────────────────────────────
+// Entry: current candle closes above 20-period resistance (price only — no volume data)
 // SL: 3% below entry  |  TP: 10% above entry  |  Max hold: 10 days
 function breakoutSignal(asset) {
   const d = pd[asset];
   if (d.closes.length < 22) return false;
 
   // 20 candles before current (exclude current candle)
-  const priorHighs   = d.highs.slice(-21, -1);
-  const priorVolumes = d.volumes.slice(-21, -1);
-
+  const priorHighs = d.highs.slice(-21, -1);
   const resistance = Math.max(...priorHighs);
-  const avgVolume  = priorVolumes.reduce((a, b) => a + b, 0) / priorVolumes.length;
+  const currentClose = d.closes[d.closes.length - 1];
 
-  const currentClose  = d.closes[d.closes.length - 1];
-  const currentVolume = d.volumes[d.volumes.length - 1];
-
-  if (currentClose > resistance && currentVolume > 1.5 * avgVolume) {
-    log(`[BREAKOUT] ${asset}: close ${currentClose.toFixed(2)} > resistance ${resistance.toFixed(2)}, vol ${currentVolume.toFixed(0)} > 1.5x avg ${avgVolume.toFixed(0)}`);
+  if (currentClose > resistance) {
+    log(`[BREAKOUT] ${asset}: close ${currentClose.toFixed(2)} > resistance ${resistance.toFixed(2)}`);
     return true;
   }
   return false;
