@@ -1300,7 +1300,7 @@ async function loadForecast() {
       },
     });
 
-    const srcLabel = `DVOL log-normal  ${(data.impliedVol * 100).toFixed(1)}% ann.`;
+    const srcLabel = \`DVOL log-normal  \${(data.impliedVol * 100).toFixed(1)}% ann.\`;
     document.getElementById('forecast-meta').innerHTML =
       \`<span>Current price: <strong>$\${currentPrice.toFixed(0)}</strong></span>\` +
       \`<span>Deribit DVOL: <strong>\${ivPct}% ann.</strong></span>\` +
