@@ -247,11 +247,18 @@ app.get('/api/forecast', async (req, res) => {
         return (isNaN(day) || mon === undefined || isNaN(yr)) ? null : new Date(yr, mon, day).getTime();
       }
 
-      // Find expiry closest to 30 days from now
-      const target30 = Date.now() + 30 * 24 * 60 * 60 * 1000;
-      const expiries = [...new Set(calls.map(o => parseExpiry(o.instrument_name)).filter(Boolean))];
+      console.log('[FORECAST] Sample instruments:', calls.slice(0, 5).map(o => o.instrument_name));
+
+      // Pick expiry with the most total open interest (most liquid)
+      const oiByExpiry = {};
+      for (const o of calls) {
+        const exp = parseExpiry(o.instrument_name);
+        if (!exp) continue;
+        oiByExpiry[exp] = (oiByExpiry[exp] || 0) + (o.open_interest || 0);
+      }
+      const expiries = Object.keys(oiByExpiry).map(Number);
       if (!expiries.length) throw new Error('Could not parse any expiries');
-      const bestExpiry = expiries.reduce((a, b) => Math.abs(a - target30) <= Math.abs(b - target30) ? a : b);
+      const bestExpiry = expiries.reduce((a, b) => oiByExpiry[a] >= oiByExpiry[b] ? a : b);
 
       // Build strike→delta map for the chosen expiry
       const chain = {};

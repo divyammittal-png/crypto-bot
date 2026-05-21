@@ -136,13 +136,22 @@ async function fetchKlines(asset) {
 // ─── DERIBIT DVOL ─────────────────────────────────────────────────────────────
 async function fetchDVOL() {
   try {
-    const url = 'https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=3600&count=1';
-    const data = await httpsGetJSON(url);
-    const entry = data?.result?.data?.[0];
+    const d1 = await httpsGetJSON('https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd');
+    if (d1?.result?.volatility != null) {
+      state.impliedVol = d1.result.volatility / 100;
+      log(`[DVOL] BTC implied vol: ${(state.impliedVol * 100).toFixed(1)}% (index_price)`);
+      return;
+    }
+  } catch(e) {
+    log(`[DVOL] get_index_price failed (${e.message}), trying daily DVOL`);
+  }
+  try {
+    const d2 = await httpsGetJSON('https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=86400&count=7');
+    const entry = d2?.result?.data?.[0];
     if (entry) {
       const dvol = entry[4] != null ? entry[4] : entry[1];
       state.impliedVol = dvol / 100;
-      log(`[DVOL] BTC implied vol: ${(state.impliedVol * 100).toFixed(1)}%`);
+      log(`[DVOL] BTC implied vol: ${(state.impliedVol * 100).toFixed(1)}% (dvol-daily)`);
     }
   } catch(e) {
     log(`[DVOL] Error: ${e.message}`);
