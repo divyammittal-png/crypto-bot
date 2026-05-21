@@ -109,29 +109,24 @@ app.post('/api/killswitch/reset', (req, res) => {
 
 // ─── SCORECARD API ───────────────────────────────────────────────────────────
 app.get('/api/scorecard', (req, res) => {
-  const trades  = loadJSON(F.trades) || [];
-  const weights = loadJSON(F.weights) || {};
-  const strats  = ['ptj','statArb','multiFactor','allWeather'];
-  const profiles = ['aggressive','balanced','conservative'];
+  const trades = loadJSON(F.trades) || [];
+  const strats = ['breakout', 'emaPullback'];
   const out = {};
   for (const strat of strats) {
-    out[strat] = {};
-    for (const prof of profiles) {
-      const t = trades.filter(x => x.strategy === strat && x.profile === prof);
-      const wins = t.filter(x => x.win);
-      const wr   = t.length ? wins.length / t.length : 0;
-      const pnl  = t.reduce((s, x) => s + (x.pnl || 0), 0);
-      const returns = t.map(x => x.pnlPct);
-      const mn  = returns.length ? returns.reduce((a, b) => a + b, 0) / returns.length : 0;
-      const sd  = returns.length > 1 ? Math.sqrt(returns.reduce((a, b) => a + (b - mn) ** 2, 0) / returns.length) : 0;
-      const sharpe = sd > 0 ? (mn / sd) * Math.sqrt(252) : 0;
-      let peak = 0, maxDD = 0, run = 0;
-      for (const x of t) { run += x.pnl || 0; if (run > peak) peak = run; maxDD = Math.max(maxDD, peak - run); }
-      const losses = t.filter(x => !x.win);
-      const avgWin  = wins.length  ? wins.reduce((s, x) => s + (x.pnl || 0), 0) / wins.length   : 0;
-      const avgLoss = losses.length ? losses.reduce((s, x) => s + (x.pnl || 0), 0) / losses.length : 0;
-      out[strat][prof] = { wr, sharpe, maxDD, trades: t.length, pnl, wt: weights[`${strat}_${prof}`] || 0.25, avgWin, avgLoss };
-    }
+    const t = trades.filter(x => x.strategy === strat);
+    const wins   = t.filter(x => x.win);
+    const losses = t.filter(x => !x.win);
+    const wr     = t.length ? wins.length / t.length : 0;
+    const pnl    = t.reduce((s, x) => s + (x.pnl || 0), 0);
+    const returns = t.map(x => x.pnlPct);
+    const mn  = returns.length ? returns.reduce((a, b) => a + b, 0) / returns.length : 0;
+    const sd  = returns.length > 1 ? Math.sqrt(returns.reduce((a, b) => a + (b - mn) ** 2, 0) / returns.length) : 0;
+    const sharpe = sd > 0 ? (mn / sd) * Math.sqrt(252) : 0;
+    let peak = 0, maxDD = 0, run = 0;
+    for (const x of t) { run += x.pnl || 0; if (run > peak) peak = run; maxDD = Math.max(maxDD, peak - run); }
+    const avgWin  = wins.length   ? wins.reduce((s, x) => s + (x.pnl || 0), 0) / wins.length   : 0;
+    const avgLoss = losses.length ? losses.reduce((s, x) => s + (x.pnl || 0), 0) / losses.length : 0;
+    out[strat] = { wr, sharpe, maxDD, trades: t.length, pnl, avgWin, avgLoss };
   }
   res.json(out);
 });
@@ -452,15 +447,8 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
       <table>
         <thead>
           <tr>
-            <th rowspan="2">Strategy</th>
-            <th colspan="8" style="text-align:center;border-left:2px solid var(--border)">AGGRESSIVE</th>
-            <th colspan="8" style="text-align:center;border-left:2px solid var(--border)">BALANCED</th>
-            <th colspan="8" style="text-align:center;border-left:2px solid var(--border)">CONSERVATIVE</th>
-          </tr>
-          <tr>
-            <th style="border-left:2px solid var(--border)">WR%</th><th>Sharpe</th><th>MaxDD</th><th>Trades</th><th>P&amp;L</th><th>Avg W</th><th>Avg L</th><th>Wt</th>
-            <th style="border-left:2px solid var(--border)">WR%</th><th>Sharpe</th><th>MaxDD</th><th>Trades</th><th>P&amp;L</th><th>Avg W</th><th>Avg L</th><th>Wt</th>
-            <th style="border-left:2px solid var(--border)">WR%</th><th>Sharpe</th><th>MaxDD</th><th>Trades</th><th>P&amp;L</th><th>Avg W</th><th>Avg L</th><th>Wt</th>
+            <th>Strategy</th>
+            <th>WR%</th><th>Sharpe</th><th>Max DD</th><th>Trades</th><th>P&amp;L</th><th>Avg Win</th><th>Avg Loss</th>
           </tr>
         </thead>
         <tbody id="scorecard-body"></tbody>
@@ -791,24 +779,21 @@ function updatePnlSummary(data) {
 }
 
 function updateScorecard(scorecard) {
-  const strats = ['ptj','statArb','multiFactor','allWeather'];
-  const profiles = ['aggressive','balanced','conservative'];
+  const strats = ['breakout','emaPullback'];
   const tbody = document.getElementById('scorecard-body');
-
   tbody.innerHTML = strats.map(strat => {
-    const cols = profiles.map(prof => {
-      const m = (scorecard && scorecard[strat] && scorecard[strat][prof]) || { wr:0, sharpe:0, maxDD:0, trades:0, pnl:0, wt:0.25, avgWin:0, avgLoss:0 };
-      const sharpeClass = m.sharpe>1?'sharpe-green':m.sharpe>0?'sharpe-yellow':'sharpe-red';
-      return \`<td style="border-left:2px solid var(--border)">\${(m.wr*100).toFixed(0)}%</td>
-        <td class="\${sharpeClass}">\${m.sharpe.toFixed(2)}</td>
-        <td>\${m.maxDD>0?'-£'+m.maxDD.toFixed(2):'—'}</td>
-        <td>\${m.trades}</td>
-        <td class="\${m.pnl>=0?'up':'dn'}">\${m.pnl>=0?'+':'−'}£\${Math.abs(m.pnl).toFixed(2)} <span class="pnl-label \${m.pnl>=0?'pnl-label-profit':'pnl-label-loss'}">\${m.pnl>=0?'▲':'▼'}</span></td>
-        <td class="up">\${m.avgWin!==0?'+£'+Math.abs(m.avgWin).toFixed(2):'—'}</td>
-        <td class="dn">\${m.avgLoss!==0?'-£'+Math.abs(m.avgLoss).toFixed(2):'—'}</td>
-        <td>\${(m.wt*100).toFixed(0)}%</td>\`;
-    }).join('');
-    return \`<tr><td><strong>\${stratLabel(strat)}</strong></td>\${cols}</tr>\`;
+    const m = (scorecard && scorecard[strat]) || { wr:0, sharpe:0, maxDD:0, trades:0, pnl:0, avgWin:0, avgLoss:0 };
+    const sharpeClass = m.sharpe>1?'sharpe-green':m.sharpe>0?'sharpe-yellow':'sharpe-red';
+    return \`<tr>
+      <td><strong>\${stratLabel(strat)}</strong></td>
+      <td>\${(m.wr*100).toFixed(0)}%</td>
+      <td class="\${sharpeClass}">\${m.sharpe.toFixed(2)}</td>
+      <td>\${m.maxDD>0?'-£'+m.maxDD.toFixed(2):'—'}</td>
+      <td>\${m.trades}</td>
+      <td class="\${m.pnl>=0?'up':'dn'}">\${m.pnl>=0?'+':'−'}£\${Math.abs(m.pnl).toFixed(2)} <span class="pnl-label \${m.pnl>=0?'pnl-label-profit':'pnl-label-loss'}">\${m.pnl>=0?'▲':'▼'}</span></td>
+      <td class="up">\${m.avgWin!==0?'+£'+Math.abs(m.avgWin).toFixed(2):'—'}</td>
+      <td class="dn">\${m.avgLoss!==0?'-£'+Math.abs(m.avgLoss).toFixed(2):'—'}</td>
+    \</tr>\`;
   }).join('');
 }
 
@@ -1116,7 +1101,7 @@ function switchTab(id, el) {
 }
 
 function stratLabel(s) {
-  return { ptj:'PTJ Trend', statArb:'Stat-Arb', multiFactor:'Multi-Factor', allWeather:'All-Weather' }[s] || s;
+  return { breakout:'Breakout', emaPullback:'EMA Pullback' }[s] || s;
 }
 
 function fmtPrice(p) {
