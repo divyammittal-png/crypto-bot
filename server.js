@@ -167,7 +167,7 @@ app.post('/api/killswitch/reset', (req, res) => {
 // ─── SCORECARD API ───────────────────────────────────────────────────────────
 app.get('/api/scorecard', (req, res) => {
   const trades = loadJSON(F.trades) || [];
-  const strats = ['breakout', 'emaPullback'];
+  const strats = ['breakout', 'emaPullback', 'optionsSignal'];
   const out = {};
   for (const strat of strats) {
     const t = trades.filter(x => x.strategy === strat);
@@ -928,7 +928,7 @@ function updatePnlSummary(data) {
 }
 
 function updateScorecard(scorecard) {
-  const strats = ['breakout','emaPullback'];
+  const strats = ['breakout','emaPullback','optionsSignal'];
   const tbody = document.getElementById('scorecard-body');
   tbody.innerHTML = strats.map(strat => {
     const m = (scorecard && scorecard[strat]) || { wr:0, sharpe:0, maxDD:0, trades:0, pnl:0, avgWin:0, avgLoss:0 };
@@ -1438,7 +1438,7 @@ function switchTab(id, el) {
 }
 
 function stratLabel(s) {
-  return { breakout:'Breakout', emaPullback:'EMA Pullback' }[s] || s;
+  return { breakout:'Breakout', emaPullback:'EMA Pullback', optionsSignal:'OptionsSignal' }[s] || s;
 }
 
 function fmtPrice(p) {
