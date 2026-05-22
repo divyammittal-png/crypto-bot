@@ -500,6 +500,12 @@ async function runOptionsSignal() {
 
   const os = state.optionsSignal;
 
+  if (os.side && !os.totalStake) {
+    log('[OPTIONS_SIGNAL] State corruption detected — resetting side/pyramidLevel');
+    os.side         = null;
+    os.pyramidLevel = 0;
+  }
+
   os.signalBuffer.push({ P_up, P_down });
   if (os.signalBuffer.length > 5) os.signalBuffer = os.signalBuffer.slice(-5);
 
