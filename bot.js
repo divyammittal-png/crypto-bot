@@ -1,5 +1,6 @@
 'use strict';
 const https = require('https');
+const http  = require('http');
 const fs    = require('fs');
 const path  = require('path');
 
@@ -73,6 +74,16 @@ function initState() {
     lastUpdate:      null,
     livePrices:      {},
     impliedVol:      null,
+    optionsSignal: {
+      side:             null,
+      totalStake:       0,
+      weightedAvgPrice: null,
+      pyramidLevel:     0,
+      signalBuffer:     [],
+      entryTime:        null,
+      waitingForReentry:  false,
+      reentryDirection: null,
+    },
   };
 }
 
@@ -126,6 +137,25 @@ function httpsPost(url, bodyObj) {
 
 async function httpsPostJSON(url, bodyObj) {
   return JSON.parse(await httpsPost(url, bodyObj));
+}
+
+function localGet(urlPath) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname: 'localhost', port: 8080, path: urlPath, method: 'GET' },
+      res => {
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => {
+          if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}`));
+          resolve(data);
+        });
+      }
+    );
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
+    req.end();
+  });
 }
 
 // ─── COINGECKO DATA ───────────────────────────────────────────────────────────
@@ -372,9 +402,21 @@ function updateNAV() {
     const cur = getCurrentPrice(pos.asset);
     if (cur) unrealised += (cur - pos.entryPrice) * pos.qty;
   }
+  const os = state.optionsSignal;
+  if (os?.side && os.weightedAvgPrice && os.totalStake) {
+    const cur = getCurrentPrice('BTC');
+    if (cur) {
+      const qty = os.totalStake / os.weightedAvgPrice;
+      unrealised += os.side === 'LONG'
+        ? (cur - os.weightedAvgPrice) * qty
+        : (os.weightedAvgPrice - cur) * qty;
+    }
+  }
   const closedPnl = allTrades.reduce((s, t) => s + t.pnl, 0);
   port.nav  = INITIAL_CAPITAL + closedPnl + unrealised;
-  port.cash = port.nav - port.positions.reduce((s, p) => s + p.notional, 0);
+  port.cash = port.nav
+    - port.positions.reduce((s, p) => s + p.notional, 0)
+    - (os?.side ? (os.totalStake || 0) : 0);
   if (port.nav > port.peakNav)        port.peakNav        = port.nav;
   if (port.nav > state.allTimeHigh)   state.allTimeHigh   = port.nav;
 }
@@ -383,6 +425,151 @@ function recordEquityCurve() {
   const nav = state.portfolios.paper.nav;
   state.equityCurve.push({ timestamp: now(), paper: nav, total: nav });
   if (state.equityCurve.length > 500) state.equityCurve = state.equityCurve.slice(-500);
+}
+
+// ─── STRATEGY 3: OPTIONS SIGNAL ──────────────────────────────────────────────
+async function fetchForecast() {
+  try {
+    return JSON.parse(await localGet('/api/forecast'));
+  } catch(e) {
+    log(`[OPTIONS_SIGNAL] Forecast fetch error: ${e.message}`);
+    return null;
+  }
+}
+
+function openOptionsPosition(side, price, stake) {
+  const os            = state.optionsSignal;
+  os.side             = side;
+  os.totalStake       = stake;
+  os.weightedAvgPrice = price;
+  os.pyramidLevel     = 0;
+  os.entryTime        = now();
+  log(`[PAPER] OPTIONS_SIGNAL OPEN ${side} BTC @${price.toFixed(2)} stake=£${stake}`);
+}
+
+function closeOptionsPosition(price, reason) {
+  const os = state.optionsSignal;
+  if (!os.side) return null;
+
+  const qty      = os.totalStake / os.weightedAvgPrice;
+  const rawPnl   = os.side === 'LONG'
+    ? (price - os.weightedAvgPrice) * qty
+    : (os.weightedAvgPrice - price) * qty;
+  const pnlPct   = (rawPnl / os.totalStake) * 100;
+  const holdMins = (Date.now() - new Date(os.entryTime).getTime()) / 60000;
+
+  allTrades.push({
+    id:                  uid(),
+    strategy:            'optionsSignal',
+    profile:             'paper',
+    asset:               'BTC',
+    side:                os.side,
+    entryPrice:          os.weightedAvgPrice,
+    qty,
+    notional:            os.totalStake,
+    pyramidLevel:        os.pyramidLevel,
+    openedAt:            os.entryTime,
+    exitPrice:           price,
+    pnl:                 +rawPnl.toFixed(4),
+    pnlPct:              +pnlPct.toFixed(4),
+    win:                 rawPnl >= 0,
+    result:              rawPnl > 0 ? 'WIN' : rawPnl < 0 ? 'LOSS' : 'BREAKEVEN',
+    exitReason:          reason,
+    closedAt:            now(),
+    holdDurationMinutes: +holdMins.toFixed(0),
+  });
+
+  log(`[PAPER] OPTIONS_SIGNAL CLOSE ${os.side} BTC @${price.toFixed(2)} P&L=£${rawPnl.toFixed(2)} (${pnlPct.toFixed(2)}%) reason=${reason}`);
+
+  const prevSide      = os.side;
+  os.side             = null;
+  os.totalStake       = 0;
+  os.weightedAvgPrice = null;
+  os.pyramidLevel     = 0;
+  os.entryTime        = null;
+  return prevSide;
+}
+
+async function runOptionsSignal() {
+  const forecast = await fetchForecast();
+  if (!forecast || forecast.P_up == null || forecast.P_down == null) return;
+
+  const { P_up, P_down } = forecast;
+  const price = getCurrentPrice('BTC');
+  if (!price) return;
+
+  const os = state.optionsSignal;
+
+  os.signalBuffer.push({ P_up, P_down });
+  if (os.signalBuffer.length > 5) os.signalBuffer = os.signalBuffer.slice(-5);
+
+  let confirmed = null;
+  if (os.signalBuffer.length === 5) {
+    if (os.signalBuffer.every(r => r.P_up > r.P_down))  confirmed = 'BUY';
+    if (os.signalBuffer.every(r => r.P_down > r.P_up))  confirmed = 'SHORT';
+  }
+
+  log(`[OPTIONS_SIGNAL] P_up=${(P_up*100).toFixed(1)}% P_down=${(P_down*100).toFixed(1)}% confirmed=${confirmed} side=${os.side || 'none'} pyramid=${os.pyramidLevel}`);
+
+  if (os.side) {
+    // Stop loss
+    const stopHit = os.side === 'LONG'
+      ? price < os.weightedAvgPrice * 0.95
+      : price > os.weightedAvgPrice * 1.05;
+
+    if (stopHit) {
+      const stoppedSide      = closeOptionsPosition(price, 'STOP_LOSS');
+      os.waitingForReentry   = true;
+      os.reentryDirection    = stoppedSide;
+      return;
+    }
+
+    // Signal flip
+    if (os.side === 'LONG' && confirmed === 'SHORT') {
+      closeOptionsPosition(price, 'SIGNAL_FLIP');
+      os.waitingForReentry = false;
+      os.reentryDirection  = null;
+      openOptionsPosition('SHORT', price, 100);
+      return;
+    }
+    if (os.side === 'SHORT' && confirmed === 'BUY') {
+      closeOptionsPosition(price, 'SIGNAL_FLIP');
+      os.waitingForReentry = false;
+      os.reentryDirection  = null;
+      openOptionsPosition('LONG', price, 100);
+      return;
+    }
+
+    // Pyramid
+    const unrealisedPct = os.side === 'LONG'
+      ? (price - os.weightedAvgPrice) / os.weightedAvgPrice
+      : (os.weightedAvgPrice - price) / os.weightedAvgPrice;
+
+    for (const { threshold, level, addStake } of [
+      { threshold: 0.05, level: 1, addStake: 200 },
+      { threshold: 0.10, level: 2, addStake: 400 },
+      { threshold: 0.15, level: 3, addStake: 800 },
+    ]) {
+      if (unrealisedPct >= threshold && os.pyramidLevel < level) {
+        os.weightedAvgPrice = (os.totalStake * os.weightedAvgPrice + addStake * price)
+                            / (os.totalStake + addStake);
+        os.totalStake      += addStake;
+        os.pyramidLevel     = level;
+        log(`[OPTIONS_SIGNAL] PYRAMID L${level} ${os.side} BTC @${price.toFixed(2)} +£${addStake} total=£${os.totalStake}`);
+        break;
+      }
+    }
+
+  } else {
+    // No open position — check entry
+    if (os.waitingForReentry) {
+      if (os.reentryDirection === 'LONG'  && confirmed === 'BUY')   { openOptionsPosition('LONG',  price, 100); os.waitingForReentry = false; os.reentryDirection = null; }
+      if (os.reentryDirection === 'SHORT' && confirmed === 'SHORT') { openOptionsPosition('SHORT', price, 100); os.waitingForReentry = false; os.reentryDirection = null; }
+    } else {
+      if (confirmed === 'BUY')   openOptionsPosition('LONG',  price, 100);
+      if (confirmed === 'SHORT') openOptionsPosition('SHORT', price, 100);
+    }
+  }
 }
 
 // ─── MAIN TICK ────────────────────────────────────────────────────────────────
@@ -394,6 +581,7 @@ async function tick() {
 
   checkPositions();
   runStrategies();
+  await runOptionsSignal();
   updateNAV();
   recordEquityCurve();
 
@@ -409,7 +597,7 @@ async function tick() {
 // ─── STARTUP ──────────────────────────────────────────────────────────────────
 async function start() {
   log('═══════════════════════════════════════════════════');
-  log('      SWING BOT — Breakout + EMA Pullback');
+  log('      SWING BOT — Breakout + EMA Pullback + OptionsSignal');
   log(`      PAPER_MODE=${PAPER_MODE} | STAKE=£${PAPER_STAKE}`);
   log('═══════════════════════════════════════════════════');
 
@@ -422,6 +610,32 @@ async function start() {
     state.portfolios  = initPortfolios();
     state.allTimeHigh = INITIAL_CAPITAL;
     state.equityCurve = [];
+  }
+
+  // Migrate: ensure optionsSignal state exists
+  if (!state.optionsSignal) {
+    state.optionsSignal = {
+      side: null, totalStake: 0, weightedAvgPrice: null, pyramidLevel: 0,
+      signalBuffer: [], entryTime: null, waitingForReentry: false, reentryDirection: null,
+    };
+  }
+
+  // One-time NAV reset for OptionsSignal strategy launch
+  if (!state.optionsSignalReset) {
+    const existing = loadJSON(F.trades) || [];
+    if (existing.length) {
+      const archivePath = dataPath(`trades-archive-${Date.now()}.json`);
+      saveJSON(archivePath, existing);
+      log(`[BOT] Archived ${existing.length} trades → ${path.basename(archivePath)}`);
+    }
+    allTrades                            = [];
+    state.portfolios.paper.nav           = INITIAL_CAPITAL;
+    state.portfolios.paper.cash          = INITIAL_CAPITAL;
+    state.portfolios.paper.positions     = [];
+    state.allTimeHigh                    = INITIAL_CAPITAL;
+    state.equityCurve                    = [];
+    state.optionsSignalReset             = true;
+    log('[BOT] NAV reset to £1000 for OptionsSignal strategy launch');
   }
 
   const savedPd = loadJSON(F.priceHistory);
