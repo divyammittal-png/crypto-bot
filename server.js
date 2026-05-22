@@ -228,6 +228,24 @@ app.get('/api/pnl-summary', (req, res) => {
 });
 
 // ─── FORECAST API ─────────────────────────────────────────────────────────────
+function nearestExpiry() {
+  const expiries = [
+    { label: 'BTC-26JUN26', date: new Date('2026-06-26') },
+    { label: 'BTC-31JUL26', date: new Date('2026-07-31') },
+    { label: 'BTC-25SEP26', date: new Date('2026-09-25') },
+  ];
+  const target = Date.now() + 30 * 24 * 3600 * 1000;
+  return expiries.reduce((best, e) =>
+    Math.abs(e.date - target) < Math.abs(best.date - target) ? e : best
+  ).label;
+}
+
+async function fetchDelta(instrument) {
+  const url = `https://www.deribit.com/api/v2/public/get_order_book?instrument_name=${instrument}&depth=1`;
+  const raw = await svrGet(url);
+  return JSON.parse(raw)?.result?.greeks?.delta ?? null;
+}
+
 app.get('/api/forecast', async (req, res) => {
   try {
     const state = loadJSON(F.state) || {};
@@ -242,17 +260,42 @@ app.get('/api/forecast', async (req, res) => {
       p,
     }));
 
-    const T = 30 / 365;
-    const targets = [70000, 75000, 80000, 85000, 90000, 95000];
-    const probabilityLevels = targets.map(K => ({
-      price: K,
-      probability: S > 0 ? +normCDF(Math.log(K / S) / (impliedVol * Math.sqrt(T))).toFixed(4) : 0,
-    }));
-
     const upperBand = Array.from({ length: 30 }, (_, i) => S * Math.exp(impliedVol * Math.sqrt((i + 1) / 365)));
     const lowerBand = Array.from({ length: 30 }, (_, i) => S * Math.exp(-impliedVol * Math.sqrt((i + 1) / 365)));
 
-    res.json({ currentPrice: S, impliedVol, probabilityLevels, priceHistory, upperBand, lowerBand, source: 'dvol-lognormal' });
+    const expiry = nearestExpiry();
+    const callStrikes = [70000, 75000, 80000, 85000, 90000, 95000];
+    const putStrikes  = [70000, 75000];
+
+    const [callDeltas, putDeltas] = await Promise.all([
+      Promise.all(callStrikes.map(K => fetchDelta(`${expiry}-${K}-C`).catch(() => null))),
+      Promise.all(putStrikes.map(K  => fetchDelta(`${expiry}-${K}-P`).catch(() => null))),
+    ]);
+
+    const probabilityLevels = callStrikes.map((K, i) => ({
+      price: K,
+      probability: callDeltas[i] != null ? +callDeltas[i].toFixed(4) : null,
+    }));
+
+    const callsAbove = callStrikes
+      .map((K, i) => ({ K, delta: callDeltas[i] }))
+      .filter(({ K, delta }) => K > S && delta != null);
+    const putsBelow = putStrikes
+      .map((K, i) => ({ K, delta: putDeltas[i] }))
+      .filter(({ K, delta }) => K < S && delta != null);
+
+    const P_up   = callsAbove.length
+      ? callsAbove.reduce((s, { delta }) => s + delta, 0) / callsAbove.length : 0;
+    const P_down = putsBelow.length
+      ? putsBelow.reduce((s, { delta }) => s + Math.abs(delta), 0) / putsBelow.length : 0;
+
+    const signal = P_up > P_down + 0.05 ? 'BUY' : 'NEUTRAL';
+
+    res.json({
+      currentPrice: S, impliedVol, probabilityLevels, priceHistory, upperBand, lowerBand,
+      signal, P_up: +P_up.toFixed(4), P_down: +P_down.toFixed(4), expiry,
+      source: 'deribit-options',
+    });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
@@ -1198,8 +1241,7 @@ async function loadForecast() {
   try {
     const data = await fetch('/api/forecast').then(r => r.json());
     if (!data.currentPrice) return;
-    const { currentPrice, impliedVol, probabilityLevels, priceHistory, upperBand, lowerBand } = data;
-    const ivPct = (impliedVol * 100).toFixed(1);
+    const { currentPrice, impliedVol, probabilityLevels, priceHistory, upperBand, lowerBand, signal, P_up, P_down, expiry } = data;
 
     const histLabels = priceHistory.map(p =>
       new Date(p.t).toLocaleString([], { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' })
@@ -1300,13 +1342,14 @@ async function loadForecast() {
       },
     });
 
-    const srcLabel = \`DVOL log-normal  \${(data.impliedVol * 100).toFixed(1)}% ann.\`;
+    const signalColor = signal === 'BUY' ? 'var(--green)' : '#718096';
     document.getElementById('forecast-meta').innerHTML =
-      \`<span>Current price: <strong>$\${currentPrice.toFixed(0)}</strong></span>\` +
-      \`<span>Deribit DVOL: <strong>\${ivPct}% ann.</strong></span>\` +
-      \`<span>Cone = ±1σ over 30 days</span>\` +
-      \`<span style="color:var(--green);font-weight:600">\${srcLabel}</span> \` +
-      probabilityLevels.map(l =>
+      \`<span style="font-size:13px">Signal: <strong style="color:\${signalColor}">\${signal}</strong></span>\` +
+      \`<span>P↑ <strong>\${(P_up * 100).toFixed(1)}%</strong>  P↓ <strong>\${(P_down * 100).toFixed(1)}%</strong></span>\` +
+      \`<span>Current: <strong>$\${currentPrice.toFixed(0)}</strong></span>\` +
+      \`<span>Expiry: <strong>\${expiry}</strong></span>\` +
+      \`<span style="color:#718096">source: deribit-options</span> \` +
+      probabilityLevels.filter(l => l.probability != null).map(l =>
         \`<span>$\${(l.price/1000).toFixed(0)}k: <strong>\${(l.probability*100).toFixed(1)}%</strong></span>\`
       ).join('');
   } catch(e) { console.error('Forecast error:', e); }
