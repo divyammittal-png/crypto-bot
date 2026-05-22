@@ -291,8 +291,13 @@ app.get('/api/forecast', async (req, res) => {
 
     const signal = P_up > P_down + 0.05 ? 'BUY' : 'NEUTRAL';
 
+    const putLevels = putStrikes.map((K, i) => ({
+      price: K,
+      probability: putDeltas[i] != null ? +Math.abs(putDeltas[i]).toFixed(4) : null,
+    }));
+
     res.json({
-      currentPrice: S, impliedVol, probabilityLevels, priceHistory, upperBand, lowerBand,
+      currentPrice: S, impliedVol, probabilityLevels, putLevels, priceHistory, upperBand, lowerBand,
       signal, P_up: +P_up.toFixed(4), P_down: +P_down.toFixed(4), expiry,
       source: 'deribit-options',
     });
@@ -622,8 +627,10 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
   <div id="tab-forecast" class="tab-content">
     <div style="position:relative;height:440px">
       <canvas id="forecast-chart"></canvas>
+      <div id="forecast-timestamp" style="position:absolute;top:8px;right:8px;font-size:11px;color:var(--muted);pointer-events:none;z-index:10"></div>
     </div>
     <div id="forecast-meta" style="margin-top:12px;font-size:12px;color:var(--muted);display:flex;gap:20px;flex-wrap:wrap;padding:4px 0"></div>
+    <div id="forecast-breakdown" style="margin-top:16px"></div>
   </div>
 
   <!-- MACRO & SENTIMENT -->
@@ -1236,12 +1243,13 @@ function showToast(msg) {
 
 // ─── PRICE FORECAST ──────────────────────────────────────────────────────────
 let forecastChart = null;
+let forecastRefreshTimer = null;
 
 async function loadForecast() {
   try {
     const data = await fetch('/api/forecast').then(r => r.json());
     if (!data.currentPrice) return;
-    const { currentPrice, impliedVol, probabilityLevels, priceHistory, upperBand, lowerBand, signal, P_up, P_down, expiry } = data;
+    const { currentPrice, impliedVol, probabilityLevels, putLevels, priceHistory, upperBand, lowerBand, signal, P_up, P_down, expiry } = data;
 
     const histLabels = priceHistory.map(p =>
       new Date(p.t).toLocaleString([], { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' })
@@ -1265,7 +1273,7 @@ async function loadForecast() {
         borderColor: 'rgba(113,128,150,0.45)', borderWidth: 1, borderDash: [4, 4],
         label: {
           display: true,
-          content: '$' + (price / 1000).toFixed(0) + 'k  δ ' + (probability * 100).toFixed(1) + '%',
+          content: '$' + (price / 1000).toFixed(0) + 'k  δ ' + (probability != null ? (probability * 100).toFixed(1) : '—') + '%',
           position: 'end', backgroundColor: 'transparent',
           color: '#718096', font: { size: 10 },
         },
@@ -1352,6 +1360,71 @@ async function loadForecast() {
       probabilityLevels.filter(l => l.probability != null).map(l =>
         \`<span>$\${(l.price/1000).toFixed(0)}k: <strong>\${(l.probability*100).toFixed(1)}%</strong></span>\`
       ).join('');
+
+    if (!forecastRefreshTimer) forecastRefreshTimer = setInterval(loadForecast, 5 * 60 * 1000);
+    document.getElementById('forecast-timestamp').textContent =
+      'Last updated: ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+    const pUpPct = (P_up  * 100).toFixed(1);
+    const pDnPct = (P_down * 100).toFixed(1);
+    const neuPct = Math.max(0, 100 - P_up * 100 - P_down * 100).toFixed(1);
+
+    const barRow = (label, pct, bg) =>
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">' +
+        '<div style="width:190px;font-size:11px;color:var(--muted);text-align:right;flex-shrink:0">' + label + '</div>' +
+        '<div style="flex:1;height:16px;background:var(--bg3);border-radius:3px;overflow:hidden">' +
+          '<div style="width:' + pct + '%;height:100%;background:' + bg + ';border-radius:3px"></div>' +
+        '</div>' +
+        '<div style="width:40px;font-size:11px;color:var(--muted);text-align:right;flex-shrink:0">' + pct + '%</div>' +
+      '</div>';
+
+    const allLevels = [
+      ...(putLevels || []).map(l => Object.assign({}, l, { kind: 'put' })),
+      ...probabilityLevels.map(l => Object.assign({}, l, { kind: 'call' })),
+    ].sort((a, b) => b.price - a.price || (a.kind === 'call' ? -1 : 1));
+
+    const tableRows = allLevels.map(l => {
+      const isAbove = l.price > currentPrice;
+      const isCall  = l.kind === 'call';
+      const arrow   = (isCall && isAbove) ? '↑' : (!isCall && !isAbove) ? '↓' : '—';
+      const aColor  = arrow === '↑' ? 'var(--green)' : arrow === '↓' ? 'var(--red)' : 'var(--muted)';
+      const barBg   = arrow === '↑' ? 'var(--green)' : arrow === '↓' ? 'var(--red)' : '#cbd5e0';
+      const pctStr  = l.probability != null ? (l.probability * 100).toFixed(1) + '%' : '—';
+      const barW    = l.probability != null ? (l.probability * 100).toFixed(1) : 0;
+      const tag     = '<span style="font-size:10px;color:var(--muted);padding:1px 4px;background:var(--bg3);border-radius:2px">' + (isCall ? 'C' : 'P') + '</span>';
+      return '<tr>' +
+        '<td style="padding:5px 8px;font-size:12px;white-space:nowrap;border-bottom:1px solid var(--border)">$' + (l.price / 1000).toFixed(0) + 'k ' + tag + '</td>' +
+        '<td style="padding:5px 8px;font-size:14px;color:' + aColor + ';border-bottom:1px solid var(--border)">' + arrow + '</td>' +
+        '<td style="padding:5px 8px;font-size:12px;font-weight:600;border-bottom:1px solid var(--border)">' + pctStr + '</td>' +
+        '<td style="padding:5px 12px 5px 4px;min-width:80px;border-bottom:1px solid var(--border)">' +
+          '<div style="height:10px;background:var(--bg3);border-radius:2px;overflow:hidden">' +
+            '<div style="width:' + barW + '%;height:100%;background:' + barBg + ';border-radius:2px"></div>' +
+          '</div>' +
+        '</td>' +
+      '</tr>';
+    }).join('');
+
+    document.getElementById('forecast-breakdown').innerHTML =
+      '<div style="font-size:11px;font-weight:600;color:var(--muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:0.06em">Market Probability Breakdown</div>' +
+      barRow('Probability UP (calls above spot)', pUpPct, 'var(--green)') +
+      barRow('Probability DOWN (puts below spot)', pDnPct, 'var(--red)') +
+      barRow('Neutral zone', neuPct, '#cbd5e0') +
+      '<div style="margin:14px 0 4px;overflow-x:auto">' +
+        '<table style="width:100%;border-collapse:collapse;min-width:280px">' +
+          '<thead><tr style="border-bottom:2px solid var(--border)">' +
+            '<th style="padding:4px 8px;font-size:11px;color:var(--muted);font-weight:500;text-align:left">Strike</th>' +
+            '<th style="padding:4px 8px;font-size:11px;color:var(--muted);font-weight:500;text-align:left">Dir</th>' +
+            '<th style="padding:4px 8px;font-size:11px;color:var(--muted);font-weight:500;text-align:left">Delta</th>' +
+            '<th style="padding:4px 12px 4px 4px;font-size:11px;color:var(--muted);font-weight:500">Visual</th>' +
+          '</tr></thead>' +
+          '<tbody>' + tableRows + '</tbody>' +
+        '</table>' +
+      '</div>' +
+      '<div style="font-size:12px;color:var(--muted);padding:10px 0 4px;border-top:1px solid var(--border);line-height:1.5">' +
+        'The market assigns <strong style="color:var(--green)">' + pUpPct + '%</strong> probability to BTC rising and ' +
+        '<strong style="color:var(--red)">' + pDnPct + '%</strong> to BTC falling by ' + expiry.replace('BTC-', '') + '. ' +
+        'Signal is <strong style="color:' + signalColor + '">' + signal + '</strong>.' +
+      '</div>';
   } catch(e) { console.error('Forecast error:', e); }
 }
 
