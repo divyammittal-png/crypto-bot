@@ -649,6 +649,10 @@ async function start() {
   state.optionsSignal.totalStake = 0;
   state.optionsSignal.pyramidLevel = 0;
   state.optionsSignal.signalBuffer = [];
+  state.optionsSignal.weightedAvgPrice = null;
+  state.optionsSignal.entryTime = null;
+  state.optionsSignal.waitingForReentry = false;
+  state.optionsSignal.reentryDirection = null;
   saveJSON(F.state, state);
 
   const savedPd = loadJSON(F.priceHistory);
