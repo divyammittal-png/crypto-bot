@@ -644,13 +644,12 @@ async function start() {
     log('[BOT] NAV reset to £1000 for OptionsSignal strategy launch');
   }
 
-  if (state.optionsSignal && state.optionsSignal.side && (!state.optionsSignal.totalStake || state.optionsSignal.totalStake === 0)) {
-    log('[OPTIONS_SIGNAL] Force-clearing corrupted state on startup');
-    state.optionsSignal.side = null;
-    state.optionsSignal.pyramidLevel = 0;
-    state.optionsSignal.signalBuffer = [];
-    saveState();
-  }
+  log('[OPTIONS_SIGNAL] Resetting state on startup — signal buffer will rebuild within 25 minutes');
+  state.optionsSignal.side = null;
+  state.optionsSignal.totalStake = 0;
+  state.optionsSignal.pyramidLevel = 0;
+  state.optionsSignal.signalBuffer = [];
+  saveState();
 
   const savedPd = loadJSON(F.priceHistory);
   if (savedPd) {
