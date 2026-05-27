@@ -649,7 +649,7 @@ async function start() {
   state.optionsSignal.totalStake = 0;
   state.optionsSignal.pyramidLevel = 0;
   state.optionsSignal.signalBuffer = [];
-  saveState();
+  saveJSON(F.state, state);
 
   const savedPd = loadJSON(F.priceHistory);
   if (savedPd) {
