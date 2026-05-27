@@ -461,6 +461,7 @@ function openOptionsPosition(side, price, stake) {
   os.pyramidLevel     = 0;
   os.entryTime        = now();
   log(`[PAPER] OPTIONS_SIGNAL OPEN ${side} BTC @${price.toFixed(2)} stake=£${stake}`);
+  updateNAV();
 }
 
 function closeOptionsPosition(price, reason) {
@@ -660,16 +661,19 @@ async function start() {
     log('[BOT] NAV reset to £1000 for OptionsSignal strategy launch');
   }
 
-  log('[OPTIONS_SIGNAL] Resetting state on startup — signal buffer will rebuild within 25 minutes');
-  state.optionsSignal.side = null;
-  state.optionsSignal.totalStake = 0;
-  state.optionsSignal.pyramidLevel = 0;
-  state.optionsSignal.signalBuffer = [];
-  state.optionsSignal.weightedAvgPrice = null;
-  state.optionsSignal.entryTime = null;
-  state.optionsSignal.waitingForReentry = false;
-  state.optionsSignal.reentryDirection = null;
-  saveJSON(F.state, state);
+  if (!state.optionsSignalV2Reset) {
+    log('[OPTIONS_SIGNAL] One-time state reset — signal buffer will rebuild within 25 minutes');
+    state.optionsSignal.side = null;
+    state.optionsSignal.totalStake = 0;
+    state.optionsSignal.pyramidLevel = 0;
+    state.optionsSignal.signalBuffer = [];
+    state.optionsSignal.weightedAvgPrice = null;
+    state.optionsSignal.entryTime = null;
+    state.optionsSignal.waitingForReentry = false;
+    state.optionsSignal.reentryDirection = null;
+    state.optionsSignalV2Reset = true;
+    saveJSON(F.state, state);
+  }
 
   const savedPd = loadJSON(F.priceHistory);
   if (savedPd) {
