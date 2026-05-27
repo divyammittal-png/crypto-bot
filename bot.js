@@ -403,6 +403,7 @@ function updateNAV() {
     if (cur) unrealised += (cur - pos.entryPrice) * pos.qty;
   }
   const os = state.optionsSignal;
+  port.positions = port.positions.filter(p => p.strategy !== 'optionsSignal');
   if (os?.side && os.weightedAvgPrice && os.totalStake) {
     const cur = getCurrentPrice('BTC');
     if (cur) {
@@ -410,6 +411,21 @@ function updateNAV() {
       unrealised += os.side === 'LONG'
         ? (cur - os.weightedAvgPrice) * qty
         : (os.weightedAvgPrice - cur) * qty;
+      const pnl = os.side === 'LONG'
+        ? (cur - os.weightedAvgPrice) / os.weightedAvgPrice * os.totalStake
+        : (os.weightedAvgPrice - cur) / os.weightedAvgPrice * os.totalStake;
+      port.positions.push({
+        asset:        'BTC',
+        strategy:     'optionsSignal',
+        profile:      'paper',
+        side:         os.side,
+        entryPrice:   os.weightedAvgPrice,
+        currentPrice: cur,
+        stake:        os.totalStake,
+        pnl,
+        pnlPct:       pnl / os.totalStake * 100,
+        openedAt:     os.entryTime,
+      });
     }
   }
   const closedPnl = allTrades.reduce((s, t) => s + t.pnl, 0);
