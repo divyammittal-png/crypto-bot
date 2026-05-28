@@ -655,7 +655,11 @@ async function start() {
     state.equityCurve = [];
   }
 
-  state.optionsSignal = initState().optionsSignal;
+  if (!state.optionsSignalV3Reset) {
+    state.optionsSignal        = initState().optionsSignal;
+    state.optionsSignalV3Reset = true;
+    log('[BOT] One-time optionsSignal state reset (V3)');
+  }
 
   // One-time NAV reset for OptionsSignal strategy launch
   if (!state.optionsSignalReset) {
