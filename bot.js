@@ -190,6 +190,21 @@ async function fetchKlines(asset) {
   }
 }
 
+async function fetchLivePrices() {
+  const url = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd';
+  const headers = process.env.COINGECKO_API_KEY
+    ? { 'x-cg-demo-api-key': process.env.COINGECKO_API_KEY }
+    : {};
+  try {
+    const data = await httpsGetJSON(url, headers);
+    if (data.bitcoin?.usd) state.livePrices.BTC = { ...state.livePrices.BTC, price: data.bitcoin.usd };
+    if (data.ethereum?.usd) state.livePrices.ETH = { ...state.livePrices.ETH, price: data.ethereum.usd };
+    log(`[CG] live BTC=${data.bitcoin?.usd} ETH=${data.ethereum?.usd}`);
+  } catch(e) {
+    log(`[CG] fetchLivePrices error: ${e.message}`);
+  }
+}
+
 // ─── DERIBIT DVOL ─────────────────────────────────────────────────────────────
 async function fetchDVOL() {
   try {
@@ -425,6 +440,7 @@ function updateNAV() {
         pnl,
         pnlPct:       pnl / os.totalStake * 100,
         openedAt:     os.entryTime,
+        stopLoss:     os.side === 'LONG' ? os.weightedAvgPrice * 0.95 : os.weightedAvgPrice * 1.05,
       });
     }
   }
@@ -601,6 +617,7 @@ async function tick() {
     await fetchKlines(asset);
     await delay(300);
   }
+  await fetchLivePrices();
 
   checkPositions();
   runStrategies();
