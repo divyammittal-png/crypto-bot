@@ -442,7 +442,7 @@ function updateNAV() {
       });
     }
   }
-  const closedPnl = allTrades.reduce((s, t) => s + t.pnl, 0);
+  const closedPnl = allTrades.reduce((s, t) => s + (t.pnl ?? 0), 0);
   port.nav  = INITIAL_CAPITAL + closedPnl + unrealised + osPnl;
   port.cash = port.nav
     - port.positions.filter(p => p.strategy !== 'optionsSignal').reduce((s, p) => s + p.notional, 0)
@@ -640,7 +640,11 @@ async function start() {
   log('═══════════════════════════════════════════════════');
 
   state     = loadJSON(F.state) || initState();
-  allTrades = loadJSON(F.trades) || [];
+  allTrades = (loadJSON(F.trades) || []).map(t => ({
+    ...t,
+    pnl:    t.pnl    ?? 0,
+    pnlPct: t.pnlPct ?? 0,
+  }));
 
   // Migrate old multi-profile state to new single paper portfolio
   if (!state.portfolios?.paper) {
