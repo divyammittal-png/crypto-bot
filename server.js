@@ -210,10 +210,14 @@ app.get('/api/pnl-summary', (req, res) => {
   let unrealised = 0;
   for (const port of Object.values(ports)) {
     for (const pos of (port.positions || [])) {
-      const cur = prices[pos.asset]?.price || pos.entryPrice;
-      unrealised += pos.side === 'LONG'
-        ? (cur - pos.entryPrice) * pos.qty
-        : (pos.entryPrice - cur) * pos.qty;
+      if (pos.pnl != null) {
+        unrealised += pos.pnl;
+      } else {
+        const cur = prices[pos.asset]?.price || pos.entryPrice;
+        unrealised += pos.side === 'LONG'
+          ? (cur - pos.entryPrice) * pos.qty
+          : (pos.entryPrice - cur) * pos.qty;
+      }
     }
   }
 
@@ -846,8 +850,12 @@ function updateStatCards(state, trades) {
   let unrealisedPnl = 0;
   for (const port of Object.values(ports)) {
     for (const pos of (port.positions||[])) {
-      const cur = livePrices[pos.asset]?.price || pos.entryPrice;
-      unrealisedPnl += pos.side==='LONG' ? (cur-pos.entryPrice)*pos.qty : (pos.entryPrice-cur)*pos.qty;
+      if (pos.pnl != null) {
+        unrealisedPnl += pos.pnl;
+      } else {
+        const cur = livePrices[pos.asset]?.price || pos.entryPrice;
+        unrealisedPnl += pos.side==='LONG' ? (cur-pos.entryPrice)*pos.qty : (pos.entryPrice-cur)*pos.qty;
+      }
     }
   }
   const uSign = unrealisedPnl >= 0 ? '+' : '−';
@@ -959,9 +967,9 @@ function updatePositions(state) {
   tbody.innerHTML = allPositions.map(pos => {
     const currentPrice = prices[pos.asset]?.price || pos.entryPrice;
     const qty = pos.qty || (pos.notional && pos.entryPrice ? pos.notional / pos.entryPrice : 0);
-    const upnl = pos.side==='LONG'
-      ? (currentPrice - pos.entryPrice) * qty
-      : (pos.entryPrice - currentPrice) * qty;
+    const upnl = pos.pnl != null
+      ? pos.pnl
+      : (pos.side==='LONG' ? (currentPrice - pos.entryPrice) * qty : (pos.entryPrice - currentPrice) * qty);
     const openedMs = new Date(pos.openedAt).getTime();
     const dur = Math.floor((Date.now()-openedMs)/60000);
     const durStr = dur > 60 ? Math.floor(dur/60)+'h '+dur%60+'m' : dur+'m';
