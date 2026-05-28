@@ -478,11 +478,11 @@ function openOptionsPosition(side, price, stake) {
 }
 
 function closeOptionsPosition(price, reason) {
+  if (!state.optionsSignal.side) return null;
   const os = state.optionsSignal;
-  if (!os.side) return null;
 
   const qty      = os.totalStake / os.weightedAvgPrice;
-  const rawPnl   = os.side === 'LONG'
+  const rawPnl   = state.optionsSignal.side === 'LONG'
     ? (price - os.weightedAvgPrice) * qty
     : (os.weightedAvgPrice - price) * qty;
   const pnlPct   = (rawPnl / os.totalStake) * 100;
@@ -509,10 +509,10 @@ function closeOptionsPosition(price, reason) {
     holdDurationMinutes: +holdMins.toFixed(0),
   });
 
-  log(`[PAPER] OPTIONS_SIGNAL CLOSE ${os.side} BTC @${price.toFixed(2)} P&L=£${rawPnl.toFixed(2)} (${pnlPct.toFixed(2)}%) reason=${reason}`);
+  log(`[PAPER] OPTIONS_SIGNAL CLOSE ${state.optionsSignal.side} BTC @${price.toFixed(2)} P&L=£${rawPnl.toFixed(2)} (${pnlPct.toFixed(2)}%) reason=${reason}`);
 
-  const prevSide      = os.side;
-  os.side             = null;
+  const prevSide           = state.optionsSignal.side;
+  state.optionsSignal.side = null;
   os.totalStake       = 0;
   os.weightedAvgPrice = null;
   os.pyramidLevel     = 0;
@@ -649,13 +649,7 @@ async function start() {
     state.equityCurve = [];
   }
 
-  // Migrate: ensure optionsSignal state exists
-  if (!state.optionsSignal) {
-    state.optionsSignal = {
-      side: null, totalStake: 0, weightedAvgPrice: null, pyramidLevel: 0,
-      signalBuffer: [], entryTime: null, waitingForReentry: false, reentryDirection: null,
-    };
-  }
+  state.optionsSignal = initState().optionsSignal;
 
   // One-time NAV reset for OptionsSignal strategy launch
   if (!state.optionsSignalReset) {
@@ -675,18 +669,10 @@ async function start() {
     log('[BOT] NAV reset to £1000 for OptionsSignal strategy launch');
   }
 
-  if (!state.optionsSignalV2Reset) {
-    log('[OPTIONS_SIGNAL] One-time state reset — signal buffer will rebuild within 25 minutes');
-    state.optionsSignal.side = null;
-    state.optionsSignal.totalStake = 0;
-    state.optionsSignal.pyramidLevel = 0;
-    state.optionsSignal.signalBuffer = [];
-    state.optionsSignal.weightedAvgPrice = null;
-    state.optionsSignal.entryTime = null;
-    state.optionsSignal.waitingForReentry = false;
-    state.optionsSignal.reentryDirection = null;
-    state.optionsSignalV2Reset = true;
-    saveJSON(F.state, state);
+  if (isNaN(state.portfolios.paper.nav)) {
+    state.portfolios.paper.nav  = INITIAL_CAPITAL;
+    state.portfolios.paper.cash = INITIAL_CAPITAL;
+    log('[BOT] NAV was NaN — reset to £1000');
   }
 
   const savedPd = loadJSON(F.priceHistory);
