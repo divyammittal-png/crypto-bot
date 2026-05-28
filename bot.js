@@ -412,21 +412,18 @@ function runStrategies() {
 // ─── NAV ──────────────────────────────────────────────────────────────────────
 function updateNAV() {
   const port = state.portfolios.paper;
+  const os = state.optionsSignal;
+  port.positions = port.positions.filter(p => p.strategy !== 'optionsSignal');
   let unrealised = 0;
   for (const pos of port.positions) {
     const cur = getCurrentPrice(pos.asset);
     if (cur) unrealised += (cur - pos.entryPrice) * pos.qty;
   }
-  const os = state.optionsSignal;
-  port.positions = port.positions.filter(p => p.strategy !== 'optionsSignal');
+  let osPnl = 0;
   if (os?.side && os.weightedAvgPrice && os.totalStake) {
     const cur = getCurrentPrice('BTC');
     if (cur) {
-      const qty = os.totalStake / os.weightedAvgPrice;
-      unrealised += os.side === 'LONG'
-        ? (cur - os.weightedAvgPrice) * qty
-        : (os.weightedAvgPrice - cur) * qty;
-      const pnl = os.side === 'LONG'
+      osPnl = os.side === 'LONG'
         ? (cur - os.weightedAvgPrice) / os.weightedAvgPrice * os.totalStake
         : (os.weightedAvgPrice - cur) / os.weightedAvgPrice * os.totalStake;
       port.positions.push({
@@ -437,17 +434,17 @@ function updateNAV() {
         entryPrice:   os.weightedAvgPrice,
         currentPrice: cur,
         stake:        os.totalStake,
-        pnl,
-        pnlPct:       pnl / os.totalStake * 100,
+        pnl:          osPnl,
+        pnlPct:       osPnl / os.totalStake * 100,
         openedAt:     os.entryTime,
         stopLoss:     os.side === 'LONG' ? os.weightedAvgPrice * 0.95 : os.weightedAvgPrice * 1.05,
       });
     }
   }
   const closedPnl = allTrades.reduce((s, t) => s + t.pnl, 0);
-  port.nav  = INITIAL_CAPITAL + closedPnl + unrealised;
+  port.nav  = INITIAL_CAPITAL + closedPnl + unrealised + osPnl;
   port.cash = port.nav
-    - port.positions.reduce((s, p) => s + p.notional, 0)
+    - port.positions.filter(p => p.strategy !== 'optionsSignal').reduce((s, p) => s + p.notional, 0)
     - (os?.side ? (os.totalStake || 0) : 0);
   if (port.nav > port.peakNav)        port.peakNav        = port.nav;
   if (port.nav > state.allTimeHigh)   state.allTimeHigh   = port.nav;
