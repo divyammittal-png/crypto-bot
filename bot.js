@@ -433,6 +433,7 @@ function updateNAV() {
         side:         os.side,
         entryPrice:   os.weightedAvgPrice,
         currentPrice: cur,
+        qty:          os.totalStake / os.weightedAvgPrice,
         stake:        os.totalStake,
         pnl:          osPnl,
         pnlPct:       osPnl / os.totalStake * 100,
@@ -660,6 +661,7 @@ async function start() {
       log(`[BOT] Archived ${existing.length} trades → ${path.basename(archivePath)}`);
     }
     allTrades                            = [];
+    saveJSON(F.trades, []);
     state.portfolios.paper.nav           = INITIAL_CAPITAL;
     state.portfolios.paper.cash          = INITIAL_CAPITAL;
     state.portfolios.paper.positions     = [];
@@ -669,10 +671,16 @@ async function start() {
     log('[BOT] NAV reset to £1000 for OptionsSignal strategy launch');
   }
 
-  if (isNaN(state.portfolios.paper.nav)) {
+  if (state.portfolios.paper.nav == null || isNaN(state.portfolios.paper.nav)) {
     state.portfolios.paper.nav  = INITIAL_CAPITAL;
     state.portfolios.paper.cash = INITIAL_CAPITAL;
-    log('[BOT] NAV was NaN — reset to £1000');
+    log('[BOT] NAV was null/NaN — reset to £1000');
+  }
+  if (state.portfolios.paper.peakNav == null || isNaN(state.portfolios.paper.peakNav)) {
+    state.portfolios.paper.peakNav = INITIAL_CAPITAL;
+  }
+  if (state.allTimeHigh == null || isNaN(state.allTimeHigh)) {
+    state.allTimeHigh = INITIAL_CAPITAL;
   }
 
   const savedPd = loadJSON(F.priceHistory);

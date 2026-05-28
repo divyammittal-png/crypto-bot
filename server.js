@@ -833,7 +833,9 @@ function updateStatCards(state, trades) {
   const rSign = realisedPnl >= 0 ? '+' : '−';
   document.getElementById('s-realised-pnl').innerHTML = rSign + '£' + Math.abs(realisedPnl).toFixed(2) + ' <span class="pnl-label ' + (realisedPnl>=0?'pnl-label-profit':'pnl-label-loss') + '">' + (realisedPnl>=0?'▲ PROFIT':'▼ LOSS') + '</span>';
   document.getElementById('s-realised-pnl').className = 'stat-value ' + (realisedPnl>=0?'up':'dn');
-  document.getElementById('s-realised-sub').textContent = (realisedPct>=0?'+':'−') + Math.abs(realisedPct).toFixed(2) + '% of capital · ' + (trades||[]).length + ' trades';
+  const winCount = (trades||[]).filter(t => t.win).length;
+  const wrPct = (trades||[]).length ? (winCount / (trades||[]).length * 100).toFixed(0) : '0';
+  document.getElementById('s-realised-sub').textContent = (realisedPct>=0?'+':'−') + Math.abs(realisedPct).toFixed(2) + '% of capital · ' + (trades||[]).length + ' trades · ' + wrPct + '% WR';
   document.getElementById('realised-pnl-card').className = 'stat-card ' + (realisedPnl>=0?'green':'red');
 
   const openCount = Object.values(ports).reduce((s,p)=>(s+(p.positions||[]).length),0);
@@ -1041,7 +1043,7 @@ function updateRiskGauges(state, trades) {
   const ports = state.portfolios||{};
   const total = Object.values(ports).reduce((s,p)=>s+(p.nav||0),0);
   const ath   = state.allTimeHigh || 1000;
-  const dd    = ath > 0 ? Math.max(0,(ath-total)/ath*100) : 0;
+  const dd    = (ath > 0 && total > 0) ? Math.max(0,(ath-total)/ath*100) : 0;
 
   const heat = Object.values(ports).reduce((s,p)=>{
     if (!p.nav||p.nav===0) return s;
