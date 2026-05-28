@@ -375,6 +375,7 @@ function checkPositions() {
   const toClose = [];
 
   for (const pos of port.positions) {
+    if (pos.strategy === 'optionsSignal') continue;
     const price = getCurrentPrice(pos.asset);
     if (!price) continue;
 
